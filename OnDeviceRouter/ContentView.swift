@@ -5,6 +5,7 @@ struct Message: Identifiable {
     let query: String
     var answer: RoutedAnswer?
     var isError = false
+    var errorText: String?
     var isLoading = true
 }
 
@@ -14,6 +15,7 @@ struct ContentView: View {
     @State private var messages: [Message] = []
     @State private var input = ""
     @State private var isWorking = false
+    @State private var availabilityWarning: String?
 
     var body: some View {
         NavigationStack {
@@ -28,6 +30,18 @@ struct ContentView: View {
                 .font(.footnote)
                 .padding(.horizontal)
                 .padding(.vertical, 8)
+
+                // Surface a clear warning when the on-device model can't run
+                // (e.g. Apple Intelligence off) — privacy-gated queries fail
+                // closed rather than leaking to the cloud.
+                if let warning = availabilityWarning {
+                    Label("On-device model unavailable: \(warning). Sensitive queries will fail instead of leaving your phone.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal)
+                        .padding(.vertical, 6)
+                }
 
                 Divider()
 
@@ -65,6 +79,9 @@ struct ContentView: View {
             }
             .navigationTitle("On-Device Router")
         }
+        .onAppear {
+            availabilityWarning = LocalModelService.availability()
+        }
     }
 
     private func send() {
@@ -89,9 +106,11 @@ struct ContentView: View {
                     }
                 }
             } catch {
+                let description = error.localizedDescription
                 withAnimation(.easeInOut(duration: 0.25)) {
                     updateMessage(pendingMessage.id) { message in
                         message.isError = true
+                        message.errorText = description
                         message.isLoading = false
                     }
                 }
@@ -139,7 +158,7 @@ private struct MessageRow: View {
                             .textSelection(.enabled)
                             .transition(.opacity)
                     } else if message.isError {
-                        Label("Something went wrong — check your connection and API key.",
+                        Label(message.errorText ?? "Something went wrong — check your connection and API key.",
                               systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
                     }
