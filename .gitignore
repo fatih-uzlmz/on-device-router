@@ -1,0 +1,11 @@
+# Local API credentials
+Secrets.swift
+
+# macOS metadata
+.DS_Store
+
+# Xcode per-user workspace state
+xcuserdata/
+
+# Local code-analysis artifacts
+graphify-out/
