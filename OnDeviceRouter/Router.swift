@@ -2,7 +2,7 @@ import Foundation
 
 /// Where a query should be executed.
 enum RouteDestination: String, Codable {
-    case local   // on-device SLM via Apple Foundation Models
+    case local   // on-device Llama 3.2 via MLX Swift
     case cloud   // frontier model via API
 }
 

@@ -7,5 +7,8 @@ Secrets.swift
 # Xcode per-user workspace state
 xcuserdata/
 
+# Xcode device application data exports
+*.xcappdata/
+
 # Local code-analysis artifacts
 graphify-out/

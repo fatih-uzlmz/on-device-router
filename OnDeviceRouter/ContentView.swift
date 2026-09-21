@@ -5,6 +5,7 @@ struct Message: Identifiable {
     let query: String
     var answer: RoutedAnswer?
     var isError = false
+    var errorMessage: String?
     var isLoading = true
 }
 
@@ -18,16 +19,27 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Session stats — the cost-savings headline.
+                // This build intentionally bypasses all routing and cloud code.
                 HStack {
-                    Label("\(Int(engine.onDeviceRate * 100))% on-device", systemImage: "cpu")
+                    Label("Local-only memory lab", systemImage: "iphone")
                     Spacer()
-                    Text("\(engine.auditLog.count) queries routed")
+                    Text("\(engine.auditLog.count) local turns")
                         .foregroundStyle(.secondary)
                 }
                 .font(.footnote)
                 .padding(.horizontal)
                 .padding(.vertical, 8)
+
+                LlamaStatusRow(status: engine.localModelStatus)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+
+                MemoryStatusRow(
+                    diagnostics: engine.memoryDiagnostics,
+                    lastRecallHitCount: engine.lastRecallHitCount
+                )
+                .padding(.horizontal)
+                .padding(.bottom, 8)
 
                 Divider()
 
@@ -63,7 +75,8 @@ struct ContentView: View {
                 }
                 .padding()
             }
-            .navigationTitle("On-Device Router")
+            .navigationTitle("Local Memory Lab")
+            .task { await engine.refreshMemoryDiagnostics() }
         }
     }
 
@@ -92,6 +105,7 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     updateMessage(pendingMessage.id) { message in
                         message.isError = true
+                        message.errorMessage = error.localizedDescription
                         message.isLoading = false
                     }
                 }
@@ -110,6 +124,34 @@ struct ContentView: View {
         withAnimation(.easeOut(duration: 0.3)) {
             proxy.scrollTo(id, anchor: .bottom)
         }
+    }
+}
+
+private struct MemoryStatusRow: View {
+    let diagnostics: MemoryDiagnostics
+    let lastRecallHitCount: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: diagnostics.persistenceError == nil
+                  ? "externaldrive.fill.badge.checkmark"
+                  : "externaldrive.fill.badge.exclamationmark")
+                .foregroundStyle(diagnostics.persistenceError == nil ? .green : .red)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(diagnostics.storedCount) turns stored locally")
+                    .font(.caption.bold())
+                if let error = diagnostics.persistenceError {
+                    Text("Save failed: \(error)")
+                        .foregroundStyle(.red)
+                } else {
+                    Text("Last lookup: \(lastRecallHitCount) memories · \(diagnostics.embeddedCount) vectors · \(diagnostics.graphEdgeCount) graph edges")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption2)
+            Spacer()
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -139,7 +181,7 @@ private struct MessageRow: View {
                             .textSelection(.enabled)
                             .transition(.opacity)
                     } else if message.isError {
-                        Label("Something went wrong — check your connection and API key.",
+                        Label(message.errorMessage ?? "Something went wrong.",
                               systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
                     }
@@ -149,6 +191,64 @@ private struct MessageRow: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 16))
                 Spacer(minLength: 48)
             }
+        }
+    }
+}
+
+private struct LlamaStatusRow: View {
+    let status: LocalModelStatus
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Built with Meta Llama 3.2 1B")
+                    .font(.caption.bold())
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if case .downloading(let fraction) = status {
+                ProgressView(value: fraction)
+                    .frame(width: 72)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var detail: String {
+        switch status {
+        case .waiting:
+            return "Downloads once on the first on-device request"
+        case .downloading(let fraction):
+            return "Downloading locally… \(Int(fraction * 100))%"
+        case .loading:
+            return "Loading model into memory…"
+        case .generating:
+            return "Generating privately on this iPhone…"
+        case .ready:
+            return "Ready for offline on-device inference"
+        case .failed(let message):
+            return message
+        }
+    }
+
+    private var icon: String {
+        switch status {
+        case .failed: "exclamationmark.triangle.fill"
+        case .ready: "checkmark.circle.fill"
+        case .generating: "cpu"
+        default: "arrow.down.circle"
+        }
+    }
+
+    private var color: Color {
+        switch status {
+        case .failed: .red
+        case .ready: .green
+        default: .accentColor
         }
     }
 }
