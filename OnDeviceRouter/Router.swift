@@ -22,7 +22,7 @@ struct RoutingDecision {
 ///   3. DECISION — score >= threshold → cloud, otherwise on-device.
 struct OnDeviceRouter {
 
-    static let threshold = 1.5
+    static let threshold = 2.0
 
     // MARK: - Privacy gate (forced local)
 
