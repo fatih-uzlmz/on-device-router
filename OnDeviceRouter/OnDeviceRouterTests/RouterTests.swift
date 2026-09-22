@@ -11,7 +11,7 @@
 import Testing
 @testable import OnDeviceRouter
 
-private struct SeedCase {
+struct SeedCase {
     let query: String
     let expected: RouteDestination
     let category: String

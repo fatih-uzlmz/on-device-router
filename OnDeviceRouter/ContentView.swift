@@ -76,6 +76,16 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("Local Memory Lab")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                        MemoryBrowserView(engine: engine)
+                    } label: {
+                        Label("Memory", systemImage: "brain.head.profile")
+                    }
+                    .accessibilityLabel("Open stored memory")
+                }
+            }
             .task { await engine.refreshMemoryDiagnostics() }
         }
     }
@@ -127,6 +137,159 @@ struct ContentView: View {
     }
 }
 
+/// A read-only, markdown-like view of each local memory lifecycle.
+@available(iOS 26.0, *)
+private struct MemoryBrowserView: View {
+    @ObservedObject var engine: RoutingEngine
+
+    var body: some View {
+        List {
+            Section {
+                LabeledContent("Durable facts", value: "\(engine.memoryDiagnostics.durableFactCount)")
+                LabeledContent("Relationships", value: "\(engine.memoryDiagnostics.relationshipCount)")
+                LabeledContent("Recent episodes", value: "\(engine.memoryDiagnostics.episodicCount)")
+                LabeledContent("Temporary turns", value: "\(engine.memoryDiagnostics.temporaryTurnCount)")
+                LabeledContent("Invalidated facts", value: "\(engine.memoryDiagnostics.invalidatedFactCount)")
+                LabeledContent("Embedded vectors", value: "\(engine.memoryDiagnostics.embeddedCount)")
+                LabeledContent("Graph edges", value: "\(engine.memoryDiagnostics.graphEdgeCount)")
+                LabeledContent("Schema", value: "v\(engine.memoryDiagnostics.schemaVersion)")
+                LabeledContent("Storage", value: "Application Support/memories.json")
+            } header: {
+                Text("# Memory.md")
+            } footer: {
+                Text("\(engine.memoryDiagnostics.migrationStatus). Turns and episodes expire; invalidated facts remain only for audit and are excluded from recall.")
+            }
+
+            if engine.memoryDiagnostics.storedCount == 0
+                && engine.memorySnapshot.invalidatedFacts.isEmpty {
+                ContentUnavailableView(
+                    "No memories stored",
+                    systemImage: "brain.head.profile",
+                    description: Text("Personal facts will appear here when you share them.")
+                )
+            }
+
+            if !engine.memorySnapshot.durableFacts.isEmpty {
+                Section("Durable personal facts") {
+                    ForEach(engine.memorySnapshot.durableFacts) { FactRow(fact: $0) }
+                }
+            }
+            if !engine.memorySnapshot.relationships.filter(\.isActive).isEmpty {
+                Section("Entities & relationships") {
+                    ForEach(engine.memorySnapshot.relationships.filter(\.isActive)) {
+                        RelationshipRow(relationship: $0)
+                    }
+                }
+            }
+            if !engine.memorySnapshot.episodes.isEmpty {
+                Section("Recent episodic context") {
+                    ForEach(engine.memorySnapshot.episodes) { episode in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(episode.kind.replacingOccurrences(of: "_", with: " ").capitalized,
+                                  systemImage: "clock.arrow.circlepath")
+                                .font(.caption.bold())
+                            Text(episode.value).textSelection(.enabled)
+                            Text("Expires \(episode.expiresAt, format: .dateTime.month(.abbreviated).day().hour().minute())")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            if !engine.memorySnapshot.conversationTurns.isEmpty {
+                Section("Temporary conversation turns") {
+                    ForEach(engine.memorySnapshot.conversationTurns) { turn in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(turn.userMessage).font(.body).textSelection(.enabled)
+                            Text(turn.assistantMessage).font(.caption).foregroundStyle(.secondary)
+                                .lineLimit(3).textSelection(.enabled)
+                            Text("Expires \(turn.expiresAt, format: .dateTime.month(.abbreviated).day().hour().minute())")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            if !engine.memorySnapshot.invalidatedFacts.isEmpty {
+                Section("Invalidated facts") {
+                    ForEach(engine.memorySnapshot.invalidatedFacts) { FactRow(fact: $0) }
+                }
+            }
+        }
+        .navigationTitle("Memory.md")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable {
+            await engine.refreshMemoryDiagnostics()
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await engine.refreshMemoryDiagnostics() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .accessibilityLabel("Refresh stored memory")
+            }
+        }
+        .task {
+            await engine.refreshMemoryDiagnostics()
+        }
+    }
+}
+
+@available(iOS 26.0, *)
+private struct FactRow: View {
+    let fact: DurableFact
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(fact.isActive ? "Current fact" : "Invalidated", systemImage: fact.isActive ? "checkmark.seal" : "xmark.seal")
+                    .font(.caption.bold())
+                    .foregroundStyle(fact.isActive ? Color.primary : Color.red)
+                Spacer()
+                Text(fact.updatedAt, format: .dateTime.month(.abbreviated).day().hour().minute())
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Text(fact.statement).font(.body).textSelection(.enabled)
+            Label("\(fact.triple.subject) · \(fact.triple.predicate) · \(fact.triple.object)",
+                  systemImage: "arrow.left.and.right")
+                .font(.caption).foregroundStyle(.blue)
+            HStack(spacing: 12) {
+                Label("×\(fact.reinforcementCount)", systemImage: "plus.circle")
+                Label("\(fact.relatedFactIDs.count) links", systemImage: "point.3.connected.trianglepath.dotted")
+                Label("\(fact.accessCount) reads", systemImage: "eye")
+            }
+            .font(.caption2).foregroundStyle(.secondary)
+            if let source = fact.sources.last {
+                Text("Source: “\(source.text)”").font(.caption2).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if let invalidAt = fact.invalidatedAt {
+                Text("Invalidated \(invalidAt, format: .dateTime.month(.abbreviated).day().hour().minute())")
+                    .font(.caption2.bold()).foregroundStyle(.red)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+@available(iOS 26.0, *)
+private struct RelationshipRow: View {
+    let relationship: EntityRelationship
+
+    var body: some View {
+        HStack {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .foregroundStyle(.blue)
+            Text(relationship.triple.subject)
+            Text("→ \(relationship.triple.predicate) →").foregroundStyle(.secondary)
+            Text(relationship.triple.object)
+        }
+        .font(.caption)
+        .textSelection(.enabled)
+    }
+}
+
 private struct MemoryStatusRow: View {
     let diagnostics: MemoryDiagnostics
     let lastRecallHitCount: Int
@@ -138,13 +301,13 @@ private struct MemoryStatusRow: View {
                   : "externaldrive.fill.badge.exclamationmark")
                 .foregroundStyle(diagnostics.persistenceError == nil ? .green : .red)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(diagnostics.storedCount) turns stored locally")
+                Text("\(diagnostics.durableFactCount) durable facts stored locally")
                     .font(.caption.bold())
                 if let error = diagnostics.persistenceError {
                     Text("Save failed: \(error)")
                         .foregroundStyle(.red)
                 } else {
-                    Text("Last lookup: \(lastRecallHitCount) memories · \(diagnostics.embeddedCount) vectors · \(diagnostics.graphEdgeCount) graph edges")
+                    Text("Last lookup: \(lastRecallHitCount) facts · \(diagnostics.temporaryTurnCount) temporary turns · \(diagnostics.graphEdgeCount) graph edges")
                         .foregroundStyle(.secondary)
                 }
             }

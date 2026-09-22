@@ -1,306 +1,352 @@
 import Foundation
 import NaturalLanguage
 
-/// Local-first hybrid memory engine.
+/// Fact-first, fully local memory inspired by MemLocal's useful concepts.
 ///
-/// This keeps the app's small `MemoryStore` boundary, but implements the useful
-/// parts of the Memlocal design without a cloud database: typed memories,
-/// on-device sentence embeddings, lexical fallback, persisted triples,
-/// relationship edges, two-hop graph expansion, recency, confidence, and
-/// reinforcement-aware ranking. All data remains in the app's JSON file.
+/// The implementation is native Swift: deterministic extraction comes first,
+/// JSON is versioned, raw turns expire, and only compact personal facts are
+/// eligible for durable storage. There is no Rust runtime, FFI, or network path.
 @available(iOS 26.0, *)
 actor SimpleMemoryStore: MemoryStore {
-    private let capacity = 500
-    private let fileURL: URL
-    private var sentenceEmbedding: NLEmbedding? = nil
+    nonisolated private static let schemaVersion = 2
+    nonisolated private static let durableCapacity = 200
+    nonisolated private static let invalidatedCapacity = 100
+    nonisolated private static let relationshipCapacity = 400
+    nonisolated private static let episodeCapacity = 40
+    nonisolated private static let turnCapacity = 24
+    nonisolated private static let transientLifetime: TimeInterval = 24 * 60 * 60
 
-    private var exchanges: [MemoryExchange]
+    private struct StoreDocument: Codable {
+        var version: Int
+        var createdAt: Date
+        var updatedAt: Date
+        var durableFacts: [DurableFact]
+        var relationships: [EntityRelationship]
+        var episodes: [EpisodicMemory]
+        var conversationTurns: [TemporaryConversationTurn]
+
+        static func empty(now: Date = Date()) -> StoreDocument {
+            StoreDocument(
+                version: schemaVersion,
+                createdAt: now,
+                updatedAt: now,
+                durableFacts: [],
+                relationships: [],
+                episodes: [],
+                conversationTurns: []
+            )
+        }
+    }
+
+    /// Decoder for both the original five-field MVP and the later broad ledger.
+    private struct LegacyExchange: Decodable {
+        let userMessage: String
+        let assistantMessage: String
+        let route: String
+        let timestamp: Date
+
+        private enum CodingKeys: String, CodingKey {
+            case userMessage, assistantMessage, route, timestamp
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            userMessage = try values.decode(String.self, forKey: .userMessage)
+            assistantMessage = try values.decodeIfPresent(String.self, forKey: .assistantMessage) ?? ""
+            route = try values.decodeIfPresent(String.self, forKey: .route) ?? "local"
+            timestamp = try values.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
+        }
+    }
+
+    private struct ExtractedFact {
+        let triple: MemoryTriple
+        let statement: String
+        let importance: Double
+        let relationships: [MemoryTriple]
+    }
+
+    private struct RankedFact {
+        let fact: DurableFact
+        var score: Double
+        let lexical: Double
+        let semantic: Double
+        let entity: Double
+        let graphHops: Int?
+    }
+
+    private let fileURL: URL
+    private var document: StoreDocument
     private var persistenceError: String?
-    private var hasMigratedMetadata = false
+    private var migrationStatus: String
+    private var sentenceEmbedding: NLEmbedding?
 
     init(fileURL: URL? = nil) {
         let resolvedURL = fileURL ?? Self.storeURL(fileName: "memories.json")
+        let loaded = Self.load(from: resolvedURL)
         self.fileURL = resolvedURL
-        self.exchanges = Self.load(from: resolvedURL)
-        print("[Memory] loaded \(exchanges.count) locally stored turn(s); sentence embeddings deferred")
+        self.document = loaded.document
+        self.migrationStatus = loaded.status
+        self.persistenceError = loaded.error
+        self.sentenceEmbedding = nil
+
+        if loaded.shouldPersist {
+            Self.write(document: loaded.document, to: resolvedURL)
+        }
+        print("[Memory] \(loaded.status); facts=\(loaded.document.durableFacts.filter(\.isActive).count), turns=\(loaded.document.conversationTurns.count)")
     }
 
-    func save(_ exchange: MemoryExchange) async {
-        ensureMetadata()
-        let enriched = enrich(exchange)
-        invalidateContradictions(with: enriched)
+    func ingest(userMessage: String, assistantMessage: String, route: String) async {
+        let now = Date()
+        purgeExpired(now: now)
 
-        if let existingIndex = exchanges.firstIndex(where: { isDuplicate($0, of: enriched) }) {
-            var existing = exchanges[existingIndex]
-            existing.assistantMessage = enriched.assistantMessage
-            existing.route = enriched.route
-            existing.timestamp = enriched.timestamp
-            existing.embedding = enriched.embedding
-            existing.triple = enriched.triple ?? existing.triple
-            existing.memoryType = enriched.memoryType
-            existing.confidence = max(existing.confidence, enriched.confidence)
-            existing.reinforcementCount += 1
-            exchanges[existingIndex] = existing
-            print("[Memory] reinforced existing \(existing.id.uuidString.prefix(8)) (count=\(existing.reinforcementCount))")
+        document.conversationTurns.append(TemporaryConversationTurn(
+            id: UUID(),
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            route: route,
+            timestamp: now,
+            expiresAt: now.addingTimeInterval(Self.transientLifetime)
+        ))
+
+        let facts = Self.extractDurableFacts(from: userMessage)
+        let episodes = Self.extractEpisodes(from: userMessage, now: now)
+        if facts.isEmpty {
+            print("[Memory][Extract] skipped durable storage: no personal fact in ‘\(Self.logSnippet(userMessage))’")
         } else {
-            exchanges.append(enriched)
+            print("[Memory][Extract] \(facts.count) durable fact(s): \(facts.map(\.statement).joined(separator: " | "))")
         }
 
-        if exchanges.count > capacity {
-            exchanges.removeFirst(exchanges.count - capacity)
+        for extracted in facts {
+            upsert(extracted, sourceText: userMessage, timestamp: now)
         }
-        rebuildGraph()
+        for episode in episodes {
+            document.episodes.removeAll { $0.kind == episode.kind }
+            document.episodes.append(episode)
+            print("[Memory][Episode] \(episode.kind)=\(episode.value), expires=\(episode.expiresAt)")
+        }
+
+        rebuildFactGraph()
+        enforceBounds()
         persist()
-        print("[Memory] saved turn, total stored: \(exchanges.count), graph edges: \(graphEdgeCount())")
     }
 
-    func recall(matching query: String, limit: Int = 5) async -> [MemoryExchange] {
-        ensureMetadata()
-        let words = Set(Self.keywords(in: query))
-        guard !words.isEmpty else {
-            print("[Memory] recall skipped: query has no meaningful keywords")
-            return []
+    func snapshot() async -> MemorySnapshot {
+        purgeExpired(now: Date())
+        let activeFacts = document.durableFacts
+            .filter(\.isActive)
+            .sorted { $0.updatedAt > $1.updatedAt }
+        let invalidated = document.durableFacts
+            .filter { !$0.isActive }
+            .sorted { ($0.invalidatedAt ?? .distantPast) > ($1.invalidatedAt ?? .distantPast) }
+        return MemorySnapshot(
+            durableFacts: activeFacts,
+            relationships: document.relationships.sorted { $0.createdAt > $1.createdAt },
+            episodes: document.episodes.sorted { $0.createdAt > $1.createdAt },
+            conversationTurns: document.conversationTurns.sorted { $0.timestamp > $1.timestamp },
+            invalidatedFacts: invalidated
+        )
+    }
+
+    func recall(matching query: String, limit: Int = 5) async -> MemoryRecall {
+        purgeExpired(now: Date())
+        let activeFacts = document.durableFacts.filter(\.isActive)
+        let terms = Self.expandedQueryTerms(for: query)
+        guard !terms.isEmpty, !activeFacts.isEmpty else {
+            print("[Memory][Recall] no candidates (terms=\(terms.count), activeFacts=\(activeFacts.count))")
+            return .empty
         }
 
-        let queryEmbedding = embedding(for: query)
-        let queryVector = queryEmbedding.vector
-        let queryTriple = Self.extractTriple(from: query)
-        var ranked = exchanges.compactMap { exchange -> RankedMemory? in
-            guard Self.isUsefulForRecall(exchange) else { return nil }
-            guard exchange.invalidAt == nil else { return nil }
-            let lexical = lexicalScore(exchange, words: words)
-            let semantic = Self.cosine(queryVector, exchange.embedding)
-            let triple = tripleScore(queryTriple, record: exchange)
-            let qualifies = lexical > 0 || triple > 0 || (queryEmbedding.isSemantic && semantic >= 0.78)
+        let queryEmbedding = embedding(for: query + " " + terms.joined(separator: " "))
+        var ranked: [RankedFact] = activeFacts.compactMap { fact in
+            let lexical = bm25Score(documentText: fact.statement + " " + fact.sources.map(\.text).joined(separator: " "),
+                                    queryTerms: terms,
+                                    corpus: activeFacts)
+            let semantic = Self.cosine(queryEmbedding.vector, fact.embedding)
+            let entity = Self.entityScore(fact.triple, queryTerms: terms)
+            let qualifies = lexical > 0 || entity > 0 || (queryEmbedding.isSemantic && semantic >= 0.72)
             guard qualifies else { return nil }
 
-            let recency = recencyScore(for: exchange)
-            let importance = importanceScore(for: exchange)
-            let base = (semantic * 0.35)
-                + (lexical * 0.30)
-                + (triple * 0.15)
-                + (recency * 0.10)
-                + (importance * 0.10)
-            return RankedMemory(exchange: exchange, score: base, lexical: lexical, semantic: semantic)
+            let ageDays = max(0, Date().timeIntervalSince(fact.updatedAt) / 86_400)
+            let recency = exp(-0.001 * ageDays)
+            let reinforcement = min(1, log1p(Double(fact.reinforcementCount)) / log1p(10))
+            let importance = min(1, fact.importance * 0.65 + reinforcement * 0.35)
+            let score = lexical * 0.32 + semantic * 0.24 + entity * 0.22
+                + recency * 0.07 + importance * 0.15
+            return RankedFact(fact: fact, score: score, lexical: lexical,
+                              semantic: semantic, entity: entity, graphHops: nil)
         }
 
-        let seedIDs = ranked
-            .sorted { $0.score > $1.score }
-            .prefix(5)
-            .map { $0.exchange.id }
-        let distances = graphDistances(from: seedIDs, maxHops: 2)
+        let seedIDs = ranked.sorted { $0.score > $1.score }.prefix(4).map { $0.fact.id }
+        let graphDistances = graphDistances(from: Array(seedIDs), maxHops: 2)
+        let rankedIDs = Set(ranked.map { $0.fact.id })
+        for fact in activeFacts where !rankedIDs.contains(fact.id) {
+            guard let hops = graphDistances[fact.id], hops > 0 else { continue }
+            ranked.append(RankedFact(
+                fact: fact,
+                score: hops == 1 ? 0.22 : 0.12,
+                lexical: 0,
+                semantic: 0,
+                entity: 0,
+                graphHops: hops
+            ))
+            print("[Memory][Graph] expanded \(hops) hop(s) to \(fact.statement)")
+        }
+
         ranked = ranked.map { item in
-            guard let distance = distances[item.exchange.id], distance > 0 else { return item }
-            let graphBonus = distance == 1 ? 0.15 : 0.08
-            return RankedMemory(exchange: item.exchange,
-                                score: item.score + graphBonus,
-                                lexical: item.lexical,
-                                semantic: item.semantic)
+            guard let hops = graphDistances[item.fact.id], hops > 0 else { return item }
+            var updated = item
+            updated.score += hops == 1 ? 0.12 : 0.06
+            return updated
         }
 
-        let selected = ranked
-            .sorted {
-                if $0.score != $1.score { return $0.score > $1.score }
-                return $0.exchange.timestamp > $1.exchange.timestamp
-            }
-            .prefix(max(1, min(limit, 8)))
-            .map { $0.exchange }
-
+        let selectedRanked = ranked.sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.fact.updatedAt > $1.fact.updatedAt
+        }.prefix(max(1, min(limit, 8)))
+        let selected = selectedRanked.map(\.fact)
         let selectedIDs = Set(selected.map(\.id))
-        for index in exchanges.indices where selectedIDs.contains(exchanges[index].id) {
-            exchanges[index].accessCount += 1
-            exchanges[index].lastAccessedAt = Date()
+
+        for index in document.durableFacts.indices where selectedIDs.contains(document.durableFacts[index].id) {
+            document.durableFacts[index].accessCount += 1
+            document.durableFacts[index].lastAccessedAt = Date()
+        }
+
+        let relevantEpisodes = document.episodes.filter { episode in
+            !Set(Self.keywords(in: episode.value + " " + episode.kind)).isDisjoint(with: Set(terms))
+        }.prefix(2)
+        let relevantRelationships = document.relationships.filter {
+            $0.isActive && selectedIDs.contains($0.sourceFactID)
+        }
+
+        for item in selectedRanked {
+            print("[Memory][Recall] candidate score=\(Self.format(item.score)) lex=\(Self.format(item.lexical)) sem=\(Self.format(item.semantic)) entity=\(Self.format(item.entity)) graph=\(item.graphHops.map(String.init) ?? "-") :: \(item.fact.statement)")
         }
         if !selected.isEmpty { persist() }
-
-        let summary = ranked
-            .sorted { $0.score > $1.score }
-            .prefix(selected.count)
-            .map { "\($0.exchange.id.uuidString.prefix(8)):\(String(format: "%.2f", $0.score))" }
-            .joined(separator: ", ")
-        print("[Memory] hybrid recall → \(selected.count) hit(s), top scores=[\(summary)]")
-        return selected
+        return MemoryRecall(facts: selected,
+                            episodes: Array(relevantEpisodes),
+                            relationships: relevantRelationships)
     }
 
-    func promptContext(matching query: String, limit: Int = 5) async -> String {
-        let hits = await recall(matching: query, limit: limit)
-        guard !hits.isEmpty else { return "" }
-        let lines = hits.map { memory in
-            let fact = memory.triple.map { " | Fact: \($0.subject) \($0.predicate) \($0.object)" } ?? ""
-            return "- [\(memory.memoryType.rawValue)] User: \(memory.userMessage)\n  Assistant: \(memory.assistantMessage)\(fact)"
-        }
-        return "Relevant memories from earlier conversations:\n" + lines.joined(separator: "\n")
+    func count() async -> Int {
+        document.durableFacts.filter(\.isActive).count
     }
-
-    func count() async -> Int { exchanges.count }
 
     func diagnostics() async -> MemoryDiagnostics {
-        ensureMetadata()
+        purgeExpired(now: Date())
+        let activeFacts = document.durableFacts.filter(\.isActive)
+        let invalidated = document.durableFacts.count - activeFacts.count
         let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
-        var typeCounts: [String: Int] = [:]
-        for exchange in exchanges {
-            typeCounts[exchange.memoryType.rawValue, default: 0] += 1
-        }
         return MemoryDiagnostics(
-            storedCount: exchanges.count,
+            storedCount: activeFacts.count + document.episodes.count + document.conversationTurns.count,
+            durableFactCount: activeFacts.count,
+            relationshipCount: document.relationships.filter(\.isActive).count,
+            episodicCount: document.episodes.count,
+            temporaryTurnCount: document.conversationTurns.count,
+            invalidatedFactCount: invalidated,
             filePath: fileURL.path,
             fileExists: FileManager.default.fileExists(atPath: fileURL.path),
             fileSizeBytes: size,
             persistenceError: persistenceError,
-            embeddedCount: exchanges.filter { !$0.embedding.isEmpty }.count,
-            graphEdgeCount: graphEdgeCount(),
-            typeCounts: typeCounts
+            embeddedCount: activeFacts.filter { !$0.embedding.isEmpty }.count,
+            graphEdgeCount: activeFacts.reduce(0) { $0 + $1.relatedFactIDs.count } / 2,
+            schemaVersion: document.version,
+            migrationStatus: migrationStatus,
+            typeCounts: [
+                MemoryRecordKind.durableFact.rawValue: activeFacts.count,
+                MemoryRecordKind.relationship.rawValue: document.relationships.filter(\.isActive).count,
+                MemoryRecordKind.episodic.rawValue: document.episodes.count,
+                MemoryRecordKind.conversationTurn.rawValue: document.conversationTurns.count,
+                MemoryRecordKind.invalidatedFact.rawValue: invalidated,
+            ]
         )
     }
 
     func clear() async {
-        exchanges = []
+        document = .empty()
+        migrationStatus = "Created schema v\(Self.schemaVersion)"
         persist()
-        print("[Memory] cleared all stored turns, facts, vectors, and graph edges")
+        print("[Memory] cleared facts, relationships, episodes, and temporary turns")
     }
 
-    // MARK: - Migration and enrichment
+    // MARK: - Fact lifecycle
 
-    private func ensureMetadata() {
-        guard !hasMigratedMetadata else { return }
-        sentenceEmbedding = NLEmbedding.sentenceEmbedding(for: .english)
-        var changed = false
-        for index in exchanges.indices {
-            let enriched = enrich(exchanges[index])
-            if enriched.embedding != exchanges[index].embedding
-                || enriched.triple != exchanges[index].triple
-                || enriched.memoryType != exchanges[index].memoryType {
-                exchanges[index] = enriched
-                changed = true
+    private func upsert(_ extracted: ExtractedFact, sourceText: String, timestamp: Date) {
+        let key = Self.factKey(extracted.triple)
+        let object = Self.normalized(extracted.triple.object)
+        if let index = document.durableFacts.firstIndex(where: {
+            $0.isActive && Self.factKey($0.triple) == key
+                && Self.normalized($0.triple.object) == object
+        }) {
+            document.durableFacts[index].updatedAt = timestamp
+            document.durableFacts[index].confidence = min(1, document.durableFacts[index].confidence + 0.03)
+            document.durableFacts[index].reinforcementCount += 1
+            if !document.durableFacts[index].sources.contains(where: { $0.text == sourceText }) {
+                document.durableFacts[index].sources.append(FactSource(text: sourceText, timestamp: timestamp))
+                document.durableFacts[index].sources = Array(document.durableFacts[index].sources.suffix(5))
+            }
+            print("[Memory][Dedup] reinforced \(extracted.statement) count=\(document.durableFacts[index].reinforcementCount)")
+            return
+        }
+
+        if Self.singleValuedPredicates.contains(Self.normalized(extracted.triple.predicate)) {
+            for index in document.durableFacts.indices where document.durableFacts[index].isActive
+                && Self.factKey(document.durableFacts[index].triple) == key
+                && Self.normalized(document.durableFacts[index].triple.object) != object {
+                document.durableFacts[index].invalidatedAt = timestamp
+                document.durableFacts[index].confidence *= 0.5
+                let invalidID = document.durableFacts[index].id
+                for relationshipIndex in document.relationships.indices
+                    where document.relationships[relationshipIndex].sourceFactID == invalidID {
+                    document.relationships[relationshipIndex].invalidatedAt = timestamp
+                }
+                print("[Memory][Contradiction] invalidated \(document.durableFacts[index].statement) → \(extracted.statement)")
             }
         }
-        rebuildGraph()
-        hasMigratedMetadata = true
-        if changed { persist() }
-        // Persisted vectors do not require keeping Apple's embedding model
-        // resident beside the 1B Llama container.
-        sentenceEmbedding = nil
-        if changed { print("[Memory] migrated existing turns to typed/vector/graph metadata") }
-    }
 
-    private func enrich(_ exchange: MemoryExchange) -> MemoryExchange {
-        var result = exchange
-        let combined = "\(result.userMessage) \(result.assistantMessage)"
-        if result.embedding.isEmpty { result.embedding = embedding(for: combined).vector }
-        if result.triple == nil { result.triple = Self.extractTriple(from: result.userMessage) }
-        if result.memoryType == .episodic { result.memoryType = Self.classify(result.userMessage) }
-        return result
-    }
-
-    private func isDuplicate(_ lhs: MemoryExchange, of rhs: MemoryExchange) -> Bool {
-        if Self.normalized(lhs.userMessage) == Self.normalized(rhs.userMessage) { return true }
-        let lexical = lexicalScore(lhs, words: Set(Self.keywords(in: rhs.userMessage)))
-        let semantic = Self.cosine(lhs.embedding, rhs.embedding)
-        return lexical >= 0.90 && semantic >= 0.90
-    }
-
-    // MARK: - Hybrid ranking
-
-    private struct RankedMemory {
-        let exchange: MemoryExchange
-        let score: Double
-        let lexical: Double
-        let semantic: Double
-    }
-
-    private func lexicalScore(_ exchange: MemoryExchange, words: Set<String>) -> Double {
-        guard !words.isEmpty else { return 0 }
-        let userBM25 = bm25Score(document: exchange.userMessage, queryWords: words)
-        let assistantBM25 = bm25Score(document: exchange.assistantMessage, queryWords: words)
-        return min(1, userBM25 * 0.75 + assistantBM25 * 0.25)
-    }
-
-    /// BM25-style local term weighting. This keeps exact names and dates strong
-    /// without letting common words dominate the semantic/vector score.
-    private func bm25Score(document: String, queryWords: Set<String>) -> Double {
-        let tokens = Self.keywords(in: document)
-        guard !tokens.isEmpty else { return 0 }
-        let documentLength = Double(tokens.count)
-        let allDocuments = exchanges.map { "\($0.userMessage) \($0.assistantMessage)" }
-        let averageLength = max(1, allDocuments
-            .map { Double(Self.keywords(in: $0).count) }
-            .reduce(0, +) / Double(max(allDocuments.count, 1)))
-        let documentSet = Set(tokens)
-        let totalDocuments = Double(max(allDocuments.count, 1))
-        let k1 = 1.2
-        let b = 0.75
-        var raw = 0.0
-
-        for word in queryWords {
-            let termFrequency = Double(tokens.filter { $0 == word }.count)
-            guard termFrequency > 0 else { continue }
-            let documentFrequency = Double(allDocuments.reduce(into: 0) { count, candidate in
-                if Set(Self.keywords(in: candidate)).contains(word) { count += 1 }
-            })
-            let idf = log((totalDocuments - documentFrequency + 0.5)
-                / (documentFrequency + 0.5) + 1)
-            let lengthNormalization = k1 * (1 - b + b * documentLength / averageLength)
-            raw += idf * ((termFrequency * (k1 + 1)) / (termFrequency + lengthNormalization))
+        let factID = UUID()
+        let fact = DurableFact(
+            id: factID,
+            triple: extracted.triple,
+            statement: extracted.statement,
+            sources: [FactSource(text: sourceText, timestamp: timestamp)],
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            invalidatedAt: nil,
+            confidence: 0.92,
+            reinforcementCount: 1,
+            accessCount: 0,
+            lastAccessedAt: nil,
+            importance: extracted.importance,
+            embedding: embedding(for: extracted.statement).vector,
+            relatedFactIDs: []
+        )
+        document.durableFacts.append(fact)
+        for triple in Self.uniqueTriples([extracted.triple] + extracted.relationships) {
+            document.relationships.append(EntityRelationship(
+                id: UUID(), triple: triple, sourceFactID: factID,
+                createdAt: timestamp, invalidatedAt: nil, confidence: 0.92
+            ))
         }
-        // Convert the unbounded BM25 sum into a stable 0...1 channel weight.
-        return documentSet.isEmpty ? 0 : raw / (raw + 2)
+        print("[Memory][Store] added durable fact \(extracted.statement)")
     }
 
-    private func tripleScore(_ query: MemoryTriple?, record: MemoryExchange) -> Double {
-        guard let query, let triple = record.triple else { return 0 }
-        let queryParts = Set([query.subject, query.predicate, query.object].map(Self.normalized))
-        let recordParts = Set([triple.subject, triple.predicate, triple.object].map(Self.normalized))
-        guard !queryParts.isEmpty else { return 0 }
-        return Double(queryParts.intersection(recordParts).count) / Double(queryParts.count)
-    }
-
-    private func recencyScore(for exchange: MemoryExchange) -> Double {
-        let days = max(0, Date().timeIntervalSince(exchange.timestamp) / 86_400)
-        let decay: Double = switch exchange.memoryType {
-        case .prospective: 0.020
-        case .episodic, .spatial, .affective: 0.005
-        default: 0.002
-        }
-        return exp(-decay * days)
-    }
-
-    private func importanceScore(for exchange: MemoryExchange) -> Double {
-        let reinforcement = min(1, log1p(Double(exchange.reinforcementCount)) / log1p(10))
-        let access = min(1, log1p(Double(exchange.accessCount)) / log1p(100))
-        return min(1, 0.45 * exchange.confidence + 0.30 * reinforcement + 0.25 * access)
-    }
-
-    private func invalidateContradictions(with newRecord: MemoryExchange) {
-        guard let newTriple = newRecord.triple else { return }
-        for index in exchanges.indices {
-            guard let oldTriple = exchanges[index].triple,
-                  exchanges[index].invalidAt == nil,
-                  Self.normalized(oldTriple.subject) == Self.normalized(newTriple.subject),
-                  Self.normalized(oldTriple.predicate) == Self.normalized(newTriple.predicate),
-                  Self.normalized(oldTriple.object) != Self.normalized(newTriple.object)
-            else { continue }
-
-            exchanges[index].invalidAt = newRecord.timestamp
-            exchanges[index].confidence *= 0.5
-            print("[Memory] invalidated contradicted fact \(exchanges[index].id.uuidString.prefix(8))")
-        }
-    }
-
-    // MARK: - Graph
-
-    private func rebuildGraph() {
-        guard exchanges.count > 1 else { return }
-        var links = Array(repeating: Set<UUID>(), count: exchanges.count)
-        for left in exchanges.indices {
-            for right in exchanges.indices where right > left {
-                guard Self.related(exchanges[left], exchanges[right]) else { continue }
-                links[left].insert(exchanges[right].id)
-                links[right].insert(exchanges[left].id)
+    private func rebuildFactGraph() {
+        let activeIndices = document.durableFacts.indices.filter { document.durableFacts[$0].isActive }
+        var links: [UUID: Set<UUID>] = [:]
+        for leftOffset in activeIndices.indices {
+            let leftIndex = activeIndices[leftOffset]
+            for rightOffset in activeIndices.indices where rightOffset > leftOffset {
+                let rightIndex = activeIndices[rightOffset]
+                let left = document.durableFacts[leftIndex]
+                let right = document.durableFacts[rightIndex]
+                guard Self.factsAreRelated(left, right, relationships: document.relationships) else { continue }
+                links[left.id, default: []].insert(right.id)
+                links[right.id, default: []].insert(left.id)
             }
         }
-        for index in exchanges.indices {
-            exchanges[index].relatedMemoryIDs = Array(links[index])
+        for index in document.durableFacts.indices {
+            document.durableFacts[index].relatedFactIDs = Array(links[document.durableFacts[index].id] ?? [])
         }
     }
 
@@ -311,67 +357,177 @@ actor SimpleMemoryStore: MemoryStore {
             let (id, distance) = queue.removeFirst()
             if distances[id] != nil || distance > maxHops { continue }
             distances[id] = distance
-            guard let exchange = exchanges.first(where: { $0.id == id }) else { continue }
-            for neighbor in exchange.relatedMemoryIDs where distances[neighbor] == nil {
-                queue.append((neighbor, distance + 1))
-            }
+            guard let fact = document.durableFacts.first(where: { $0.id == id && $0.isActive }) else { continue }
+            queue.append(contentsOf: fact.relatedFactIDs.map { ($0, distance + 1) })
         }
         return distances
     }
 
-    private func graphEdgeCount() -> Int {
-        exchanges.reduce(0) { $0 + $1.relatedMemoryIDs.count } / 2
-    }
+    // MARK: - Deterministic extraction
 
-    nonisolated private static func related(_ lhs: MemoryExchange, _ rhs: MemoryExchange) -> Bool {
-        if let left = lhs.triple, let right = rhs.triple {
-            let leftEntities = Set([left.subject, left.object].map(normalized))
-            let rightEntities = Set([right.subject, right.object].map(normalized))
-            if !leftEntities.isDisjoint(with: rightEntities) { return true }
+    nonisolated private static let relativeKinds: Set<String> = [
+        "sister", "brother", "mother", "father", "mom", "dad", "wife", "husband", "partner"
+    ]
+    nonisolated private static let petKinds: Set<String> = ["dog", "cat", "bird", "rabbit", "pet"]
+    nonisolated private static let singleValuedPredicates: Set<String> = ["name", "lives_in"]
+
+    nonisolated private static func extractDurableFacts(from source: String) -> [ExtractedFact] {
+        let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "’", with: "'")
+        guard !text.isEmpty, !text.contains("?") else { return [] }
+
+        if let captures = captures(#"^my\s+([a-z][a-z -]*?)'s\s+name\s+is\s+(.+?)[.!]?$"#, in: text) {
+            return [namedEntityFact(kind: captures[0], name: captures[1])]
         }
-        let leftWords = Set(keywords(in: lhs.userMessage))
-        let rightWords = Set(keywords(in: rhs.userMessage))
-        return leftWords.intersection(rightWords).count >= 2
+        if let captures = captures(#"^my\s+([a-z][a-z -]*?)\s+is\s+named\s+(.+?)[.!]?$"#, in: text) {
+            return [namedEntityFact(kind: captures[0], name: captures[1])]
+        }
+        if let captures = captures(#"^i\s+have\s+(?:a|an)\s+([a-z][a-z -]*?)\s+named\s+(.+?)[.!]?$"#, in: text) {
+            return [namedEntityFact(kind: captures[0], name: captures[1])]
+        }
+        if let captures = captures(#"^my\s+(sister|brother|mother|father|mom|dad|wife|husband|partner)\s+is\s+(.+?)[.!]?$"#, in: text) {
+            return [namedEntityFact(kind: captures[0], name: captures[1])]
+        }
+        if let captures = captures(#"^my\s+([a-z][a-z -]*?)\s+(loves|likes|prefers|hates)\s+(.+?)[.!]?$"#, in: text) {
+            let kind = normalized(captures[0]).replacingOccurrences(of: " ", with: "_")
+            let verb = canonicalPreferenceVerb(captures[1])
+            let object = cleanObject(captures[2])
+            return [ExtractedFact(
+                triple: MemoryTriple(subject: "user_\(kind)", predicate: verb, object: object),
+                statement: "User's \(captures[0].lowercased()) \(displayVerb(verb)) \(object).",
+                importance: 0.86,
+                relationships: []
+            )]
+        }
+        if let captures = captures(#"^i\s+(like|love|prefer|hate)\s+(.+?)[.!]?$"#, in: text) {
+            let verb = canonicalPreferenceVerb(captures[0])
+            let object = cleanObject(captures[1])
+            return [ExtractedFact(
+                triple: MemoryTriple(subject: "user", predicate: verb, object: object),
+                statement: "User \(displayVerb(verb)) \(object).",
+                importance: 0.78,
+                relationships: []
+            )]
+        }
+        if let captures = captures(#"^i\s+live\s+in\s+(.+?)[.!]?$"#, in: text) {
+            let place = cleanObject(captures[0])
+            return [ExtractedFact(
+                triple: MemoryTriple(subject: "user", predicate: "lives_in", object: place),
+                statement: "User lives in \(place).",
+                importance: 0.9,
+                relationships: []
+            )]
+        }
+        return []
     }
 
-    // MARK: - On-device embeddings
+    nonisolated private static func namedEntityFact(kind rawKind: String, name rawName: String) -> ExtractedFact {
+        let kind = normalized(rawKind).replacingOccurrences(of: " ", with: "_")
+        let name = cleanObject(rawName)
+        let subject = "user_\(kind)"
+        var relationships = [MemoryTriple(subject: name, predicate: "is_a", object: rawKind.lowercased())]
+        let statement: String
+        if petKinds.contains(kind) {
+            relationships.insert(MemoryTriple(subject: "user", predicate: "owns", object: name), at: 0)
+            statement = "User has a \(rawKind.lowercased()) named \(name)."
+        } else if relativeKinds.contains(kind) {
+            relationships.insert(MemoryTriple(subject: "user", predicate: "has_\(kind)", object: name), at: 0)
+            statement = "User's \(rawKind.lowercased()) is named \(name)."
+        } else {
+            statement = "User's \(rawKind.lowercased()) is named \(name)."
+        }
+        return ExtractedFact(
+            triple: MemoryTriple(subject: subject, predicate: "name", object: name),
+            statement: statement,
+            importance: 0.95,
+            relationships: relationships
+        )
+    }
+
+    nonisolated private static func extractEpisodes(from source: String, now: Date) -> [EpisodicMemory] {
+        let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "’", with: "'")
+        var results: [EpisodicMemory] = []
+        if let captures = captures(#"^i(?:'m|\s+am)\s+(?:currently\s+)?working\s+on\s+(.+?)[.!]?$"#, in: text) {
+            results.append(episode(kind: "current_task", value: captures[0], source: source, now: now))
+        } else if let captures = captures(#"^i(?:'m|\s+am)\s+(?:currently\s+)?(?:at|in)\s+(.+?)[.!]?$"#, in: text) {
+            results.append(episode(kind: "current_location", value: captures[0], source: source, now: now))
+        }
+        return results
+    }
+
+    nonisolated private static func episode(kind: String, value: String, source: String, now: Date) -> EpisodicMemory {
+        EpisodicMemory(
+            id: UUID(), kind: kind, value: cleanObject(value), sourceText: source,
+            createdAt: now, expiresAt: now.addingTimeInterval(transientLifetime)
+        )
+    }
+
+    // MARK: - Retrieval
+
+    private func bm25Score(documentText: String, queryTerms: [String], corpus: [DurableFact]) -> Double {
+        let tokens = Self.keywords(in: documentText)
+        guard !tokens.isEmpty else { return 0 }
+        let averageLength = max(1, corpus.map { Double(Self.keywords(in: $0.statement).count) }.reduce(0, +)
+            / Double(max(corpus.count, 1)))
+        let documentLength = Double(tokens.count)
+        let totalDocuments = Double(max(corpus.count, 1))
+        let k1 = 1.2
+        let b = 0.75
+        var raw = 0.0
+        for term in Set(queryTerms) {
+            let frequency = Double(tokens.filter { $0 == term }.count)
+            guard frequency > 0 else { continue }
+            let documentFrequency = Double(corpus.reduce(into: 0) { count, fact in
+                if Set(Self.keywords(in: fact.statement)).contains(term) { count += 1 }
+            })
+            let idf = log((totalDocuments - documentFrequency + 0.5) / (documentFrequency + 0.5) + 1)
+            let normalization = k1 * (1 - b + b * documentLength / averageLength)
+            raw += idf * (frequency * (k1 + 1) / (frequency + normalization))
+        }
+        return raw / (raw + 2)
+    }
+
+    nonisolated private static func expandedQueryTerms(for query: String) -> [String] {
+        var terms = Set(keywords(in: query))
+        let expansions: [String: Set<String>] = [
+            "dog": ["pet", "owns", "name"], "pet": ["dog", "cat", "owns", "name"],
+            "name": ["named"], "dessert": ["cake", "chocolate", "likes", "prefers"],
+            "supermarket": ["food", "cake", "chocolate", "likes", "prefers"],
+            "family": ["sister", "brother", "mother", "father", "mom", "dad", "wife", "husband", "partner"],
+            "restaurant": ["place", "places", "prefers", "likes"],
+            "where": ["lives", "location"], "live": ["lives", "location"],
+        ]
+        for term in Array(terms) {
+            terms.formUnion(expansions[term] ?? [])
+        }
+        return Array(terms)
+    }
+
+    nonisolated private static func entityScore(_ triple: MemoryTriple, queryTerms: [String]) -> Double {
+        let entityTerms = Set(keywords(in: triple.subject + " " + triple.predicate + " " + triple.object))
+        guard !entityTerms.isEmpty else { return 0 }
+        return min(1, Double(entityTerms.intersection(Set(queryTerms)).count) / 2)
+    }
+
+    // MARK: - Embeddings
 
     private func embedding(for text: String) -> (vector: [Double], isSemantic: Bool) {
-        let model = sentenceEmbedding ?? NLEmbedding.sentenceEmbedding(for: .english)
-        if let vector = model?.vector(for: text), !vector.isEmpty {
+        if sentenceEmbedding == nil {
+            sentenceEmbedding = NLEmbedding.sentenceEmbedding(for: .english)
+        }
+        if let vector = sentenceEmbedding?.vector(for: text), !vector.isEmpty {
             return (Self.normalizedVector(vector), true)
         }
         return (Self.hashedEmbedding(for: text, dimensions: 128), false)
-    }
-
-    nonisolated private static func cosine(_ lhs: [Double], _ rhs: [Double]) -> Double {
-        guard !lhs.isEmpty, lhs.count == rhs.count else { return 0 }
-        var dot = 0.0
-        var leftMagnitude = 0.0
-        var rightMagnitude = 0.0
-        for index in lhs.indices {
-            dot += lhs[index] * rhs[index]
-            leftMagnitude += lhs[index] * lhs[index]
-            rightMagnitude += rhs[index] * rhs[index]
-        }
-        guard leftMagnitude > 0, rightMagnitude > 0 else { return 0 }
-        return max(0, min(1, dot / (sqrt(leftMagnitude) * sqrt(rightMagnitude))))
-    }
-
-    nonisolated private static func normalizedVector(_ vector: [Double]) -> [Double] {
-        let magnitude = sqrt(vector.reduce(0) { $0 + ($1 * $1) })
-        guard magnitude > 0 else { return vector }
-        return vector.map { $0 / magnitude }
     }
 
     nonisolated private static func hashedEmbedding(for text: String, dimensions: Int) -> [Double] {
         var vector = Array(repeating: 0.0, count: dimensions)
         for word in keywords(in: text) {
             let hash = stableHash(word)
-            let first = Int(hash % UInt64(dimensions))
-            let second = Int((hash / UInt64(dimensions)) % UInt64(dimensions))
-            vector[first] += 1
-            vector[second] += 0.5
+            vector[Int(hash % UInt64(dimensions))] += 1
+            vector[Int((hash / UInt64(dimensions)) % UInt64(dimensions))] += 0.5
         }
         return normalizedVector(vector)
     }
@@ -382,68 +538,246 @@ actor SimpleMemoryStore: MemoryStore {
         }
     }
 
-    // MARK: - Local extraction
-
-    nonisolated private static func classify(_ text: String) -> MemoryType {
-        let value = normalized(text)
-        if value.contains("remind") || value.contains("tomorrow") || value.contains("next week") || value.contains("will ") {
-            return .prospective
-        }
-        if value.contains("how to") || value.contains("steps") || value.contains("workflow") {
-            return .procedural
-        }
-        if value.contains("feel") || value.contains("happy") || value.contains("sad") || value.contains("angry") {
-            return .affective
-        }
-        if value.contains("friend") || value.contains("mother") || value.contains("father") || value.contains("team") {
-            return .social
-        }
-        if value.contains("live in") || value.contains("located") || value.contains("near ") || value.contains("address") {
-            return .spatial
-        }
-        if value.contains("my ") || value.contains("i like") || value.contains("i prefer") || value.contains("favorite") || value.contains("name is") {
-            return .factual
-        }
-        if value.contains("because") || value.contains("means") || value.contains("definition") {
-            return .semantic
-        }
-        return .episodic
+    nonisolated private static func normalizedVector(_ vector: [Double]) -> [Double] {
+        let magnitude = sqrt(vector.reduce(0) { $0 + $1 * $1 })
+        return magnitude > 0 ? vector.map { $0 / magnitude } : vector
     }
 
-    nonisolated private static func extractTriple(from text: String) -> MemoryTriple? {
-        let value = normalized(text)
-        let words = keywords(in: value)
-        guard !words.isEmpty else { return nil }
+    nonisolated private static func cosine(_ left: [Double], _ right: [Double]) -> Double {
+        guard !left.isEmpty, left.count == right.count else { return 0 }
+        let dot = zip(left, right).reduce(0) { $0 + $1.0 * $1.1 }
+        let leftMagnitude = sqrt(left.reduce(0) { $0 + $1 * $1 })
+        let rightMagnitude = sqrt(right.reduce(0) { $0 + $1 * $1 })
+        guard leftMagnitude > 0, rightMagnitude > 0 else { return 0 }
+        return max(0, min(1, dot / (leftMagnitude * rightMagnitude)))
+    }
 
-        if let nameRange = value.range(of: "name is ") {
-            let before = String(value[..<nameRange.lowerBound])
-            let after = String(value[nameRange.upperBound...])
-            let subject = before
-                .replacingOccurrences(of: "my ", with: "")
-                .replacingOccurrences(of: " dog's ", with: " ")
-                .replacingOccurrences(of: " dog\'s ", with: " ")
-                .split(separator: " ")
-                .last
-                .map(String.init)
-            let object = after.split(separator: " ").first.map(String.init)
-            if let subject, let object { return MemoryTriple(subject: subject, predicate: "name", object: object) }
+    // MARK: - Persistence and migration
+
+    private func purgeExpired(now: Date) {
+        let oldEpisodeCount = document.episodes.count
+        let oldTurnCount = document.conversationTurns.count
+        document.episodes.removeAll { $0.expiresAt <= now }
+        document.conversationTurns.removeAll { $0.expiresAt <= now }
+        if oldEpisodeCount != document.episodes.count || oldTurnCount != document.conversationTurns.count {
+            print("[Memory][Lifecycle] expired \(oldEpisodeCount - document.episodes.count) episode(s), \(oldTurnCount - document.conversationTurns.count) turn(s)")
+            persist()
         }
+    }
 
-        for predicate in ["like", "love", "prefer", "hate"] {
-            if let range = value.range(of: "i \(predicate) ") {
-                let object = String(value[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !object.isEmpty { return MemoryTriple(subject: "user", predicate: predicate, object: object) }
+    private func enforceBounds() {
+        let active = document.durableFacts.filter(\.isActive).sorted { $0.updatedAt > $1.updatedAt }
+        let invalidated = document.durableFacts.filter { !$0.isActive }
+            .sorted { ($0.invalidatedAt ?? .distantPast) > ($1.invalidatedAt ?? .distantPast) }
+        let keptActive = Array(active.prefix(Self.durableCapacity))
+        let keptInvalidated = Array(invalidated.prefix(Self.invalidatedCapacity))
+        let keptFactIDs = Set((keptActive + keptInvalidated).map(\.id))
+        document.durableFacts = keptActive + keptInvalidated
+        document.relationships = Array(document.relationships
+            .filter { keptFactIDs.contains($0.sourceFactID) }
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(Self.relationshipCapacity))
+        document.episodes = Array(document.episodes.sorted { $0.createdAt > $1.createdAt }.prefix(Self.episodeCapacity))
+        document.conversationTurns = Array(document.conversationTurns.sorted { $0.timestamp > $1.timestamp }.prefix(Self.turnCapacity))
+    }
+
+    private func persist() {
+        document.version = Self.schemaVersion
+        document.updatedAt = Date()
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(document)
+            try data.write(to: fileURL, options: .atomic)
+            persistenceError = nil
+            print("[Memory][Persistence] schema=v\(document.version), bytes=\(data.count), facts=\(document.durableFacts.count), turns=\(document.conversationTurns.count), migration=\(migrationStatus)")
+        } catch {
+            persistenceError = error.localizedDescription
+            print("[Memory][Persistence] FAILED: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func load(from url: URL) -> (document: StoreDocument, status: String, error: String?, shouldPersist: Bool) {
+        guard let data = try? Data(contentsOf: url) else {
+            return (.empty(), "Created schema v\(schemaVersion)", nil, false)
+        }
+        do {
+            let document = try JSONDecoder().decode(StoreDocument.self, from: data)
+            guard document.version <= schemaVersion else {
+                return (.empty(), "Unsupported future schema v\(document.version)", "Memory schema is newer than this app", false)
+            }
+            return (document, "Loaded schema v\(document.version)", nil, document.version < schemaVersion)
+        } catch {
+            do {
+                let exchanges = try JSONDecoder().decode([LegacyExchange].self, from: data)
+                let migrated = migrate(exchanges: exchanges)
+                return (migrated, "Migrated \(exchanges.count) legacy turn(s) to schema v\(schemaVersion)", nil, true)
+            } catch let migrationError {
+                return (.empty(), "Load failed; preserved unreadable file", migrationError.localizedDescription, false)
             }
         }
+    }
 
-        if let myRange = value.range(of: "my ") {
-            let remainder = String(value[myRange.upperBound...])
-            let parts = remainder.components(separatedBy: " is ")
-            if parts.count == 2, let subject = parts[0].split(separator: " ").first, let object = parts[1].split(separator: " ").first {
-                return MemoryTriple(subject: String(subject), predicate: "is", object: String(object))
+    nonisolated private static func migrate(exchanges: [LegacyExchange]) -> StoreDocument {
+        let now = Date()
+        var result = StoreDocument.empty(now: now)
+        for exchange in exchanges.sorted(by: { $0.timestamp < $1.timestamp }) {
+            for extracted in extractDurableFacts(from: exchange.userMessage) {
+                let key = factKey(extracted.triple)
+                let object = normalized(extracted.triple.object)
+                if let duplicate = result.durableFacts.firstIndex(where: {
+                    $0.isActive && factKey($0.triple) == key && normalized($0.triple.object) == object
+                }) {
+                    result.durableFacts[duplicate].reinforcementCount += 1
+                    result.durableFacts[duplicate].updatedAt = exchange.timestamp
+                    continue
+                }
+                if singleValuedPredicates.contains(normalized(extracted.triple.predicate)) {
+                    for index in result.durableFacts.indices where result.durableFacts[index].isActive
+                        && factKey(result.durableFacts[index].triple) == key {
+                        result.durableFacts[index].invalidatedAt = exchange.timestamp
+                        let invalidID = result.durableFacts[index].id
+                        for relationshipIndex in result.relationships.indices
+                            where result.relationships[relationshipIndex].sourceFactID == invalidID {
+                            result.relationships[relationshipIndex].invalidatedAt = exchange.timestamp
+                        }
+                    }
+                }
+                let factID = UUID()
+                result.durableFacts.append(DurableFact(
+                    id: factID, triple: extracted.triple, statement: extracted.statement,
+                    sources: [FactSource(text: exchange.userMessage, timestamp: exchange.timestamp)],
+                    createdAt: exchange.timestamp, updatedAt: exchange.timestamp,
+                    invalidatedAt: nil, confidence: 0.9, reinforcementCount: 1,
+                    accessCount: 0, lastAccessedAt: nil, importance: extracted.importance,
+                    embedding: hashedEmbedding(for: extracted.statement, dimensions: 128), relatedFactIDs: []
+                ))
+                for triple in uniqueTriples([extracted.triple] + extracted.relationships) {
+                    result.relationships.append(EntityRelationship(
+                        id: UUID(), triple: triple, sourceFactID: factID,
+                        createdAt: exchange.timestamp, invalidatedAt: nil, confidence: 0.9
+                    ))
+                }
+            }
+            if exchange.timestamp.addingTimeInterval(transientLifetime) > now {
+                result.conversationTurns.append(TemporaryConversationTurn(
+                    id: UUID(), userMessage: exchange.userMessage,
+                    assistantMessage: exchange.assistantMessage, route: exchange.route,
+                    timestamp: exchange.timestamp,
+                    expiresAt: exchange.timestamp.addingTimeInterval(transientLifetime)
+                ))
             }
         }
-        return nil
+        result.durableFacts = Array(result.durableFacts.suffix(durableCapacity + invalidatedCapacity))
+        result.relationships = Array(result.relationships.suffix(relationshipCapacity))
+        result.conversationTurns = Array(result.conversationTurns.suffix(turnCapacity))
+        rebuildMigratedGraph(in: &result)
+        return result
+    }
+
+    nonisolated private static func rebuildMigratedGraph(in document: inout StoreDocument) {
+        let activeIndices = document.durableFacts.indices.filter { document.durableFacts[$0].isActive }
+        var links: [UUID: Set<UUID>] = [:]
+        for leftOffset in activeIndices.indices {
+            let leftIndex = activeIndices[leftOffset]
+            for rightOffset in activeIndices.indices where rightOffset > leftOffset {
+                let rightIndex = activeIndices[rightOffset]
+                let left = document.durableFacts[leftIndex]
+                let right = document.durableFacts[rightIndex]
+                guard factsAreRelated(left, right, relationships: document.relationships) else { continue }
+                links[left.id, default: []].insert(right.id)
+                links[right.id, default: []].insert(left.id)
+            }
+        }
+        for index in document.durableFacts.indices {
+            document.durableFacts[index].relatedFactIDs = Array(links[document.durableFacts[index].id] ?? [])
+        }
+    }
+
+    nonisolated private static func write(document: StoreDocument, to url: URL) {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(document).write(to: url, options: .atomic)
+        } catch {
+            print("[Memory][Migration] persistence FAILED: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func storeURL(fileName: String) -> URL {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent(fileName)
+    }
+
+    // MARK: - Helpers
+
+    nonisolated private static func factsAreRelated(
+        _ left: DurableFact,
+        _ right: DurableFact,
+        relationships: [EntityRelationship]
+    ) -> Bool {
+        let leftEntities = graphEntityTerms(in: left.triple.subject + " " + left.triple.object)
+        let rightEntities = graphEntityTerms(in: right.triple.subject + " " + right.triple.object)
+        if !leftEntities.isDisjoint(with: rightEntities) { return true }
+
+        let leftRelations = relationships.filter { $0.isActive && $0.sourceFactID == left.id }.map(\.triple)
+        let rightRelations = relationships.filter { $0.isActive && $0.sourceFactID == right.id }.map(\.triple)
+        let leftGraphEntities = Set(leftRelations.flatMap { graphEntityTerms(in: $0.subject + " " + $0.object) })
+        let rightGraphEntities = Set(rightRelations.flatMap { graphEntityTerms(in: $0.subject + " " + $0.object) })
+        return !leftGraphEntities.isDisjoint(with: rightGraphEntities)
+    }
+
+    nonisolated private static func graphEntityTerms(in text: String) -> Set<String> {
+        // `user` is a universal graph hub, not evidence that two facts are related.
+        Set(keywords(in: text)).subtracting(["user"])
+    }
+
+    nonisolated private static func captures(_ pattern: String, in text: String) -> [String]? {
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = expression.firstMatch(in: text, range: range), match.range.location != NSNotFound else { return nil }
+        return (1..<match.numberOfRanges).compactMap { index in
+            guard let range = Range(match.range(at: index), in: text) else { return nil }
+            return String(text[range])
+        }
+    }
+
+    nonisolated private static func canonicalPreferenceVerb(_ value: String) -> String {
+        switch normalized(value) {
+        case "love", "loves", "like", "likes": "likes"
+        case "prefer", "prefers": "prefers"
+        default: "hates"
+        }
+    }
+
+    nonisolated private static func displayVerb(_ value: String) -> String {
+        switch value {
+        case "likes": "likes"
+        case "prefers": "prefers"
+        default: "dislikes"
+        }
+    }
+
+    nonisolated private static func cleanObject(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    }
+
+    nonisolated private static func normalized(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    }
+
+    nonisolated private static func factKey(_ triple: MemoryTriple) -> String {
+        normalized(triple.subject) + "|" + normalized(triple.predicate)
+    }
+
+    nonisolated private static func uniqueTriples(_ triples: [MemoryTriple]) -> [MemoryTriple] {
+        var seen: Set<String> = []
+        return triples.filter {
+            seen.insert(factKey($0) + "|" + normalized($0.object)).inserted
+        }
     }
 
     nonisolated private static func keywords(in text: String) -> [String] {
@@ -451,58 +785,18 @@ actor SimpleMemoryStore: MemoryStore {
             "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "did", "does",
             "for", "from", "had", "has", "have", "how", "i", "in", "is", "it", "its", "me",
             "my", "not", "of", "on", "or", "that", "the", "this", "to", "was", "what", "when",
-            "where", "which", "who", "why", "with", "would", "you", "your"
+            "which", "who", "why", "with", "would", "you", "your"
         ]
-        let words = normalized(text)
+        return normalized(text)
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { $0.count >= 3 && !stopWords.contains($0) }
-        return Array(Set(words))
     }
 
-    nonisolated private static func normalized(_ text: String) -> String {
-        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    nonisolated private static func logSnippet(_ text: String) -> String {
+        String(text.prefix(80)).replacingOccurrences(of: "\n", with: " ")
     }
 
-    nonisolated private static func isUsefulForRecall(_ exchange: MemoryExchange) -> Bool {
-        let answer = exchange.assistantMessage.lowercased()
-        let genericRefusalMarkers = [
-            "can't provide information or assistance",
-            "cannot provide information or assistance",
-            "could be used to harm a child",
-        ]
-        return !genericRefusalMarkers.contains { answer.contains($0) }
-    }
-
-    // MARK: - Persistence
-
-    nonisolated private static func storeURL(fileName: String) -> URL {
-        let directory = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                  in: .userDomainMask)[0]
-        try? FileManager.default.createDirectory(at: directory,
-                                                 withIntermediateDirectories: true)
-        return directory.appendingPathComponent(fileName)
-    }
-
-    nonisolated private static func load(from url: URL) -> [MemoryExchange] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        do {
-            return try JSONDecoder().decode([MemoryExchange].self, from: data)
-        } catch {
-            print("[Memory] load FAILED: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    private func persist() {
-        do {
-            let data = try JSONEncoder().encode(exchanges)
-            try data.write(to: fileURL, options: .atomic)
-            persistenceError = nil
-        } catch {
-            persistenceError = error.localizedDescription
-            print("[Memory] persistence FAILED: \(error.localizedDescription)")
-        }
+    nonisolated private static func format(_ value: Double) -> String {
+        String(format: "%.2f", value)
     }
 }

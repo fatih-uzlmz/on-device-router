@@ -43,12 +43,18 @@ final class RoutingEngine: ObservableObject {
     @Published private(set) var auditLog: [AuditEntry] = []
     @Published private(set) var localModelStatus: LocalModelStatus = .waiting
     @Published private(set) var memoryDiagnostics: MemoryDiagnostics = .empty
+    @Published private(set) var memorySnapshot: MemorySnapshot = .empty
     @Published private(set) var lastRecallHitCount = 0
 
-    private let local = LocalModelService()
-    private let memory: any MemoryStore = SimpleMemoryStore()
+    private let local: any LocalModelResponding
+    private let memory: any MemoryStore
 
-    init() {
+    init(
+        local: any LocalModelResponding = LocalModelService(),
+        memory: any MemoryStore = SimpleMemoryStore()
+    ) {
+        self.local = local
+        self.memory = memory
         print("[Debug][App] Local-only memory mode initialized; cloud routing and privacy scoring are disabled")
         Task {
             await refreshMemoryDiagnostics()
@@ -62,11 +68,9 @@ final class RoutingEngine: ObservableObject {
         let turnID = String(UUID().uuidString.prefix(8))
         print("[Debug][Turn \(turnID)] started in local-only mode")
 
-        // Keep the prompt focused for the 1B model while allowing graph and
-        // semantic retrieval to contribute more than the old three-hit MVP.
-        let memories = await memory.recall(matching: query, limit: 5)
-        lastRecallHitCount = memories.count
-        print("[Debug][Turn \(turnID)] recall complete: \(memories.count) hit(s)")
+        let recall = await memory.recall(matching: query, limit: 5)
+        lastRecallHitCount = recall.facts.count
+        print("[Debug][Turn \(turnID)] recall complete: \(recall.facts.count) durable fact(s), \(recall.episodes.count) episode(s)")
 
         let decision = RoutingDecision(
             destination: .local,
@@ -74,12 +78,12 @@ final class RoutingEngine: ObservableObject {
             reasons: ["LOCAL-ONLY MEMORY MODE — routing, cloud, and privacy scoring disabled"]
         )
         let start = Date()
-        print("[Debug][Turn \(turnID)] Llama generation started with \(memories.count) recalled turn(s)")
+        print("[Debug][Turn \(turnID)] Llama generation started with structured local memory")
 
         let engine = self
         let text: String
         do {
-            text = try await local.respond(to: query, memories: memories) { status in
+            text = try await local.respond(to: query, memoryContext: recall.promptContext) { status in
                 await engine.updateLocalModelStatus(status)
             }
         } catch {
@@ -93,9 +97,9 @@ final class RoutingEngine: ObservableObject {
         let entry = AuditEntry(query: query, decision: decision, latencyMs: latencyMs)
         auditLog.insert(entry, at: 0)
 
-        await memory.save(MemoryExchange(userMessage: query,
-                                         assistantMessage: text,
-                                         route: RouteDestination.local.rawValue))
+        await memory.ingest(userMessage: query,
+                            assistantMessage: text,
+                            route: RouteDestination.local.rawValue)
         await refreshMemoryDiagnostics()
         print("[Debug][Turn \(turnID)] persisted: stored=\(memoryDiagnostics.storedCount), fileExists=\(memoryDiagnostics.fileExists), bytes=\(memoryDiagnostics.fileSizeBytes)")
         print("[Debug][Turn \(turnID)] finished")
@@ -116,5 +120,6 @@ final class RoutingEngine: ObservableObject {
 
     func refreshMemoryDiagnostics() async {
         memoryDiagnostics = await memory.diagnostics()
+        memorySnapshot = await memory.snapshot()
     }
 }
