@@ -29,6 +29,15 @@ not referenced by the active execution path.
 - Llama receives concise statements under an explicitly untrusted
   `Relevant personal memory` label, never reconstructed user/assistant history.
 
-The Rust `memlocal_core` runtime is not integrated. For this MVP its FFI,
-packaging, and cross-language lifecycle costs would add complexity without
-improving the deterministic extraction and bounded local persistence goals.
+## MemLocal text index adapter
+
+- `MemlocalMemoryStore` wraps the Swift store and keeps its versioned JSON file
+  as the authoritative ledger.
+- Active fact statements are mirrored into MemLocal's in-memory BM25 index.
+  The index is rebuilt from Swift facts on launch and synchronized after each
+  ingest; invalidated and evicted facts are removed.
+- Rust text results supplement Swift recall when the Swift store returns fewer
+  facts than requested. Swift extraction, embeddings, graph traversal, episodes,
+  JSON migration, and diagnostics remain authoritative.
+- The Rust core is pinned, vendored, and built with its optional HTTP feature
+  disabled. See `Native/README.md` for the source revision and rebuild steps.

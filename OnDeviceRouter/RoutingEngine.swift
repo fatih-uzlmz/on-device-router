@@ -51,7 +51,7 @@ final class RoutingEngine: ObservableObject {
 
     init(
         local: any LocalModelResponding = LocalModelService(),
-        memory: any MemoryStore = SimpleMemoryStore()
+        memory: any MemoryStore = MemlocalMemoryStore()
     ) {
         self.local = local
         self.memory = memory

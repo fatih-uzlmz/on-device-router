@@ -3,9 +3,9 @@ import NaturalLanguage
 
 /// Fact-first, fully local memory inspired by MemLocal's useful concepts.
 ///
-/// The implementation is native Swift: deterministic extraction comes first,
-/// JSON is versioned, raw turns expire, and only compact personal facts are
-/// eligible for durable storage. There is no Rust runtime, FFI, or network path.
+/// This store remains native Swift: deterministic extraction comes first, JSON
+/// is versioned, raw turns expire, and only compact personal facts are eligible
+/// for durable storage. The app-level MemLocal adapter only indexes active facts.
 @available(iOS 26.0, *)
 actor SimpleMemoryStore: MemoryStore {
     nonisolated private static let schemaVersion = 2
@@ -229,6 +229,17 @@ actor SimpleMemoryStore: MemoryStore {
 
     func count() async -> Int {
         document.durableFacts.filter(\.isActive).count
+    }
+
+    /// Records recall hits supplied by an additional retrieval index.
+    func recordExternalRecall(_ factIDs: Set<UUID>) {
+        guard !factIDs.isEmpty else { return }
+        let accessedAt = Date()
+        for index in document.durableFacts.indices where factIDs.contains(document.durableFacts[index].id) {
+            document.durableFacts[index].accessCount += 1
+            document.durableFacts[index].lastAccessedAt = accessedAt
+        }
+        persist()
     }
 
     func diagnostics() async -> MemoryDiagnostics {

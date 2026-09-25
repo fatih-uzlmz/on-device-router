@@ -1,0 +1,4 @@
+module MemlocalCore {
+    header "memlocal_swift.h"
+    export *
+}

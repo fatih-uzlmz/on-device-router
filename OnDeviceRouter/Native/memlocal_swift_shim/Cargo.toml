@@ -1,0 +1,11 @@
+[package]
+name = "memlocal_swift_shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+memlocal_core = { path = "../memlocal_core", default-features = false }
+serde_json = "1"
