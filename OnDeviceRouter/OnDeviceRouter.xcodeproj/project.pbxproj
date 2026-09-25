@@ -12,6 +12,7 @@
 		5D910C3F305F39E900C12656 /* CloudService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D910C3A305F39E900C12656 /* CloudService.swift */; };
 		5D910C42305F39FD00C12656 /* Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D910C40305F39FD00C12656 /* Router.swift */; };
 		5D910C43305F39FD00C12656 /* RoutingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D910C41305F39FD00C12656 /* RoutingEngine.swift */; };
+		F10000000000000000000002 /* MemlocalCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F10000000000000000000001 /* MemlocalCore.xcframework */; };
 		7A1000030000000000000001 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 7A1000020000000000000001 /* MLXLLM */; };
 		7A1000030000000000000002 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 7A1000020000000000000002 /* MLXLMCommon */; };
 		7A1000030000000000000004 /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 7A1000020000000000000004 /* HuggingFace */; };
@@ -44,6 +45,7 @@
 		5D910C3C305F39E900C12656 /* LocalModelService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelService.swift; sourceTree = "<group>"; };
 		5D910C40305F39FD00C12656 /* Router.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Router.swift; sourceTree = "<group>"; };
 		5D910C41305F39FD00C12656 /* RoutingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoutingEngine.swift; sourceTree = "<group>"; };
+		F10000000000000000000001 /* MemlocalCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Frameworks/MemlocalCore.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -69,6 +71,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F10000000000000000000002 /* MemlocalCore.xcframework in Frameworks */,
 				7A1000030000000000000001 /* MLXLLM in Frameworks */,
 				7A1000030000000000000002 /* MLXLMCommon in Frameworks */,
 				7A1000030000000000000004 /* HuggingFace in Frameworks */,
@@ -105,6 +108,7 @@
 				5D910C3C305F39E900C12656 /* LocalModelService.swift */,
 				5D910C40305F39FD00C12656 /* Router.swift */,
 				5D910C41305F39FD00C12656 /* RoutingEngine.swift */,
+				F10000000000000000000001 /* MemlocalCore.xcframework */,
 			);
 			sourceTree = "<group>";
 		};
