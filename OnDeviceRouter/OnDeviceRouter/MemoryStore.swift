@@ -81,8 +81,7 @@ nonisolated struct MemorySnapshot: Sendable {
     )
 }
 
-/// Stable transfer format used to copy the Swift ledger into a disposable
-/// MemLocal database and compare the result after reopening it. `payloadJSON`
+/// Stable format for committing the complete app ledger to Rust. `payloadJSON`
 /// carries each original Codable record without translating its fields into
 /// MemLocal's more generic model.
 nonisolated struct MemoryLedgerTransferRecord: Codable, Equatable, Sendable {
@@ -130,6 +129,105 @@ nonisolated struct MemoryLedgerTransferEnvelope: Codable, Equatable, Sendable {
             sameTime(wanted.updatedAt, found.updatedAt) &&
             sameOptionalTime(wanted.invalidatedAt, found.invalidatedAt)
         }
+    }
+
+    /// Decodes the complete Swift records preserved inside the Rust ledger.
+    func makeSnapshot() throws -> MemorySnapshot {
+        guard format == "on-device-router-ledger",
+              schemaVersion == Self.currentSchemaVersion,
+              sourceSchemaVersion == Self.sourceSwiftSchemaVersion else {
+            throw LedgerPayloadError.unsupportedSchema
+        }
+
+        let decoder = JSONDecoder()
+        var activeFacts: [DurableFact] = []
+        var invalidatedFacts: [DurableFact] = []
+        var relationships: [EntityRelationship] = []
+        var episodes: [EpisodicMemory] = []
+        var conversationTurns: [TemporaryConversationTurn] = []
+
+        func payloadMatches(
+            _ record: MemoryLedgerTransferRecord,
+            id: UUID,
+            content: String,
+            createdAt: Date,
+            updatedAt: Date,
+            invalidatedAt: Date?
+        ) -> Bool {
+            func sameTime(_ date: Date, _ timestamp: TimeInterval) -> Bool {
+                abs(date.timeIntervalSince1970 - timestamp) < 0.000_001
+            }
+            let invalidationMatches: Bool
+            if let invalidatedAt, let wrapperTime = record.invalidatedAt {
+                invalidationMatches = sameTime(invalidatedAt, wrapperTime)
+            } else {
+                invalidationMatches = invalidatedAt == nil && record.invalidatedAt == nil
+            }
+            return record.id == id.uuidString && record.content == content
+                && sameTime(createdAt, record.createdAt)
+                && sameTime(updatedAt, record.updatedAt)
+                && invalidationMatches
+        }
+
+        for record in records {
+            guard let data = record.payloadJSON.data(using: .utf8) else {
+                throw LedgerPayloadError.invalidPayload(record.id)
+            }
+            switch record.kind {
+            case .durableFact:
+                let fact = try decoder.decode(DurableFact.self, from: data)
+                guard fact.isActive,
+                      payloadMatches(record, id: fact.id, content: fact.statement,
+                                     createdAt: fact.createdAt, updatedAt: fact.updatedAt,
+                                     invalidatedAt: fact.invalidatedAt) else {
+                    throw LedgerPayloadError.invalidPayload(record.id)
+                }
+                activeFacts.append(fact)
+            case .invalidatedFact:
+                let fact = try decoder.decode(DurableFact.self, from: data)
+                guard !fact.isActive,
+                      payloadMatches(record, id: fact.id, content: fact.statement,
+                                     createdAt: fact.createdAt, updatedAt: fact.updatedAt,
+                                     invalidatedAt: fact.invalidatedAt) else {
+                    throw LedgerPayloadError.invalidPayload(record.id)
+                }
+                invalidatedFacts.append(fact)
+            case .relationship:
+                let relationship = try decoder.decode(EntityRelationship.self, from: data)
+                let content = "\(relationship.triple.subject) \(relationship.triple.predicate) \(relationship.triple.object)"
+                guard payloadMatches(record, id: relationship.id, content: content,
+                                     createdAt: relationship.createdAt,
+                                     updatedAt: relationship.createdAt,
+                                     invalidatedAt: relationship.invalidatedAt) else {
+                    throw LedgerPayloadError.invalidPayload(record.id)
+                }
+                relationships.append(relationship)
+            case .episodic:
+                let episode = try decoder.decode(EpisodicMemory.self, from: data)
+                guard payloadMatches(record, id: episode.id, content: episode.value,
+                                     createdAt: episode.createdAt, updatedAt: episode.createdAt,
+                                     invalidatedAt: nil) else {
+                    throw LedgerPayloadError.invalidPayload(record.id)
+                }
+                episodes.append(episode)
+            case .conversationTurn:
+                let turn = try decoder.decode(TemporaryConversationTurn.self, from: data)
+                guard payloadMatches(record, id: turn.id, content: turn.userMessage,
+                                     createdAt: turn.timestamp, updatedAt: turn.timestamp,
+                                     invalidatedAt: nil) else {
+                    throw LedgerPayloadError.invalidPayload(record.id)
+                }
+                conversationTurns.append(turn)
+            }
+        }
+        let snapshot = MemorySnapshot(
+            durableFacts: activeFacts,
+            relationships: relationships,
+            episodes: episodes,
+            conversationTurns: conversationTurns,
+            invalidatedFacts: invalidatedFacts
+        )
+        return snapshot
     }
 
     init(snapshot: MemorySnapshot) throws {
@@ -229,6 +327,11 @@ nonisolated struct MemoryLedgerTransferEnvelope: Codable, Equatable, Sendable {
     }
 }
 
+private enum LedgerPayloadError: Error {
+    case unsupportedSchema
+    case invalidPayload(String)
+}
+
 nonisolated struct MemoryRecall: Sendable {
     let facts: [DurableFact]
     let episodes: [EpisodicMemory]
@@ -287,6 +390,27 @@ nonisolated struct MemoryDiagnostics: Sendable {
         persistenceError: nil, embeddedCount: 0, graphEdgeCount: 0,
         schemaVersion: 3, migrationStatus: "Not loaded", typeCounts: [:]
     )
+
+    func replacingPersistence(path: String, exists: Bool, size: Int,
+                              error: String?) -> MemoryDiagnostics {
+        MemoryDiagnostics(
+            storedCount: storedCount,
+            durableFactCount: durableFactCount,
+            relationshipCount: relationshipCount,
+            episodicCount: episodicCount,
+            temporaryTurnCount: temporaryTurnCount,
+            invalidatedFactCount: invalidatedFactCount,
+            filePath: path,
+            fileExists: exists,
+            fileSizeBytes: size,
+            persistenceError: error,
+            embeddedCount: embeddedCount,
+            graphEdgeCount: graphEdgeCount,
+            schemaVersion: schemaVersion,
+            migrationStatus: migrationStatus,
+            typeCounts: typeCounts
+        )
+    }
 }
 
 nonisolated protocol MemoryStore: Sendable {

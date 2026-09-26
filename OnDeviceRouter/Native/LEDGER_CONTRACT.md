@@ -1,8 +1,8 @@
 # On-device memory ledger contract
 
-This contract defines the records that the Swift JSON ledger and its persistent
-Rust shadow must preserve. It is the compatibility boundary for the shadow
-migration. The current Swift document is schema version 3.
+This contract defines the records that the persistent Rust ledger must
+preserve. The Swift JSON document is the schema-version-3 migration source and
+recovery copy.
 
 ## Records
 
@@ -47,13 +47,15 @@ On load, Swift regenerates unknown vectors and regenerates older revisions or
 hashed vectors when the current NaturalLanguage model is available. Hashed
 facts are text-search-only until then. Rust projects vectors into its fixed
 128-dimensional index, but hybrid search compares them only when provider
-version, source dimension, and projection version all match. Hybrid runs in
-shadow mode and logs raw IDs, IDs eligible under Swift's existing topic rule,
-and Swift recall IDs. The topic rule remains part of the candidate path.
+version, source dimension, and projection version all match. Hybrid results now
+lead recall only after Swift's existing topic rule accepts them. Eligible Rust
+seeds expand through the Swift graph for up to two hops, and Swift recall stays
+available as a fallback.
 
 Promotion gate: Rust hybrid must match or beat Swift recall on paraphrase,
 correction, contradiction, and irrelevant-fact rejection before its results
-can enter recall. Swift remains the authoritative writer throughout.
+can enter recall. The recorded device gate passed all four cases before
+promotion.
 
 ## Migration and ownership
 
@@ -67,23 +69,23 @@ can enter recall. Swift remains the authoritative writer throughout.
 - Record UUIDs are unique across kinds because MemLocal's item table uses the
   UUID as its key.
 - Store the Rust database in the app's Application Support directory, scoped to
-  this app installation. Keep the Swift JSON file intact through import and
-  verification.
+  this app installation. Restore a valid existing Rust ledger on startup; use
+  Swift JSON to initialize an empty Rust database and as a recovery copy if a
+  Rust write fails.
 - Import into a new or disposable Rust database generation. A failed or
   interrupted import can be discarded and retried from the Swift ledger.
 - Verify schema version, record counts by kind, stable IDs, and a deterministic
   digest of the imported payloads after closing and reopening the Rust store.
-- Do not change the authoritative writer during this migration stage. Swift
-  remains canonical until a later cutover has compared behavior and passed
-  device restart, correction, contradiction, and recall checks.
+- Rust is the durable writer after its complete ledger has been verified.
+  Swift applies extraction, deduplication, correction, and invalidation rules
+  in memory, then commits the full snapshot to Rust. If that commit fails, save
+  the current snapshot to Swift JSON and discard the stale Rust database.
 - Treat the Rust text/vector/graph indexes as derived views. The complete
   record payload must remain recoverable independently of those indexes.
 
 ## Current scope boundary
 
-The app currently synchronizes a full snapshot into the persistent Rust shadow
-and compares its export with Swift before and after reopening the database.
-MemLocal's graph-edge rows still do not carry all Swift relationship fields,
-so the full relationship payload remains in the opaque source record. This
-stage does not transfer write authority: Swift remains canonical until the
-later behavior and device checks pass.
+The app synchronizes a full snapshot into Rust and verifies the exported
+records after reopen. MemLocal's graph-edge rows do not carry all Swift
+relationship fields, so the complete relationship payload remains in the
+opaque source record; Swift uses that record to rebuild and traverse the graph.

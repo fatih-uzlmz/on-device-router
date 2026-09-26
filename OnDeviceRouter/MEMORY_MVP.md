@@ -31,18 +31,20 @@ not referenced by the active execution path.
 - Llama receives concise statements under an explicitly untrusted
   `Relevant personal memory` label, never reconstructed user/assistant history.
 
-## MemLocal text index adapter
+## Rust ledger and hybrid recall
 
-- `MemlocalMemoryStore` wraps the Swift store and keeps its versioned JSON file
-  as the authoritative ledger.
-- The full Swift ledger is mirrored into a persistent MemLocal database and
-  verified after reopening. Active facts are eligible for text search;
-  invalidated facts remain in history and are excluded from recall.
-- Rust text results supplement Swift recall when the Swift store returns fewer
-  facts than requested. Swift extraction, embeddings, graph traversal, episodes,
-  JSON migration, and diagnostics remain authoritative.
-- Rust hybrid search runs in shadow mode during recall and logs its result IDs.
-  Promotion requires matching or beating Swift on paraphrase, correction,
-  contradiction, and irrelevant-fact rejection.
+- `MemlocalMemoryStore` uses the persistent Rust ledger as the durable source of
+  truth after startup verification. An existing Rust ledger wins on restart;
+  the versioned Swift JSON ledger bootstraps an empty Rust database and remains
+  a recovery copy if a Rust write fails.
+- Fact extraction, exact deduplication, correction handling, contradiction
+  invalidation, and the two-hop relationship graph remain in the Swift memory
+  rules before each complete ledger snapshot is written to Rust.
+- Rust hybrid results lead factual recall. Swift applies its topic filter to
+  every Rust candidate, follows eligible hybrid seeds through up to two graph
+  hops, and keeps Swift lexical/entity results as fallback.
+- The Rust hybrid candidate path passed the paraphrase, correction,
+  contradiction, and irrelevant-fact gate before promotion. See
+  `../docs/memory-shadow-validation.md` for the recorded device results.
 - The Rust core is pinned, vendored, and built with its optional HTTP feature
   disabled. See `Native/README.md` for the source revision and rebuild steps.

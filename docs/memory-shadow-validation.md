@@ -1,8 +1,8 @@
-# Memory shadow validation — 2026-09-26
+# Memory search validation — 2026-09-26
 
-The iPhone 16 running iOS 26.5 was tested through Xcode 26.2. Swift remains the
-authoritative writer and recall path. Rust hybrid results are logged in shadow
-mode; the existing Swift topic filter is mandatory for candidate eligibility.
+The iPhone 16 running iOS 26.5 was tested through Xcode 26.2. These device runs
+recorded the hybrid candidate gate before promotion. The app now uses eligible
+Rust hybrid IDs in recall and retains Swift's mandatory topic filter.
 
 ## Results
 
@@ -21,14 +21,16 @@ mode; the existing Swift topic filter is mandatory for candidate eligibility.
   The gate test uses its own temporary database and asserts that the Rust index
   stays available. One earlier rerun also encountered a SQLite lock in the
   shared app shadow database.
-- Raw Rust results included irrelevant facts. The 4/4 result applies to the
-  complete shadow candidate path with Swift's topic filter; that filter must
-  remain in place for any future promotion.
+- Raw Rust results included irrelevant facts. The 4/4 result applies only after
+  Swift's topic filter removed ineligible candidates; the same filter remains
+  on the promoted recall path.
 
-The repeated 4/4 runs establish the current shadow candidate path on this
-device, but Rust results have **not** been promoted into recall. Swift remains
-the authoritative writer and recall path. Graph retrieval, consolidation
-bridging, and write-authority migration remain out of scope.
+The repeated 4/4 runs establish the Rust hybrid candidate path on this device.
+Hybrid candidates now lead factual recall, then seed the Swift two-hop graph;
+Swift lexical/entity recall remains a fallback. Swift still applies extraction,
+deduplication, and contradiction rules before committing complete snapshots to
+the authoritative Rust ledger. The recorded runs predate those graph and
+write-authority changes, so they do not verify those paths.
 
 The app was built, installed, and launched on the wired iPhone. The device
 reported a running `OnDeviceRouter` process after launch.

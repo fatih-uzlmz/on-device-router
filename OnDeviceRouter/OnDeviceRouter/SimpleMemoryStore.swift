@@ -1,11 +1,9 @@
 import Foundation
 import NaturalLanguage
 
-/// Fact-first, fully local memory inspired by MemLocal's useful concepts.
-///
-/// This store remains native Swift: deterministic extraction comes first, JSON
-/// is versioned, raw turns expire, and only compact personal facts are eligible
-/// for durable storage. The app-level MemLocal adapter only indexes active facts.
+/// In-memory fact rules for the local app, with versioned JSON as recovery storage.
+/// Deterministic extraction comes first, raw turns expire, and only compact
+/// personal facts are eligible for durable storage.
 @available(iOS 26.0, *)
 actor SimpleMemoryStore: MemoryStore {
     nonisolated private static let schemaVersion = 3
@@ -75,15 +73,22 @@ actor SimpleMemoryStore: MemoryStore {
     }
 
     private let fileURL: URL
+    private let usesDefaultFileURL: Bool
+    private var persistenceEnabled: Bool
     private var document: StoreDocument
     private var persistenceError: String?
     private var migrationStatus: String
     private var sentenceEmbedding: NLEmbedding?
 
-    init(fileURL: URL? = nil) {
+    nonisolated var persistenceFilePath: String { fileURL.path }
+    nonisolated var usesDefaultPersistenceFile: Bool { usesDefaultFileURL }
+
+    init(fileURL: URL? = nil, persistenceEnabled: Bool = true) {
         let resolvedURL = fileURL ?? Self.storeURL(fileName: "memories.json")
         let loaded = Self.load(from: resolvedURL)
         self.fileURL = resolvedURL
+        self.usesDefaultFileURL = fileURL == nil
+        self.persistenceEnabled = persistenceEnabled
         var migrated = loaded.document
         let model = NLEmbedding.sentenceEmbedding(for: .english)
         var reembedded = 0
@@ -106,7 +111,7 @@ actor SimpleMemoryStore: MemoryStore {
         self.persistenceError = loaded.error
         self.sentenceEmbedding = nil
 
-        if loaded.shouldPersist || reembedded > 0 {
+        if persistenceEnabled && (loaded.shouldPersist || reembedded > 0) {
             Self.write(document: migrated, to: resolvedURL)
         }
         print("[Memory] \(loaded.status); re-embedded=\(reembedded); facts=\(migrated.durableFacts.filter(\.isActive).count), turns=\(migrated.conversationTurns.count)")
@@ -309,6 +314,59 @@ actor SimpleMemoryStore: MemoryStore {
             document.durableFacts[index].lastAccessedAt = accessedAt
         }
         persist()
+    }
+
+    /// Expands Rust hybrid-search seeds through the app's verified two-hop graph.
+    func graphExpansion(from seeds: [UUID], maxHops: Int = 2) -> [DurableFact] {
+        guard !seeds.isEmpty else { return [] }
+        let distances = graphDistances(from: seeds, maxHops: maxHops)
+        return document.durableFacts
+            .filter { $0.isActive && (distances[$0.id] ?? 0) > 0 }
+            .sorted {
+                let leftDistance = distances[$0.id] ?? Int.max
+                let rightDistance = distances[$1.id] ?? Int.max
+                if leftDistance != rightDistance { return leftDistance < rightDistance }
+                return $0.updatedAt > $1.updatedAt
+            }
+    }
+
+    /// Rehydrates the in-memory working set from the authoritative Rust ledger.
+    func restoreLedger(_ snapshot: MemorySnapshot) {
+        let now = Date()
+        document = StoreDocument(
+            version: Self.schemaVersion,
+            createdAt: now,
+            updatedAt: now,
+            durableFacts: snapshot.durableFacts + snapshot.invalidatedFacts,
+            relationships: snapshot.relationships,
+            episodes: snapshot.episodes,
+            conversationTurns: snapshot.conversationTurns
+        )
+        let model = NLEmbedding.sentenceEmbedding(for: .english)
+        sentenceEmbedding = model
+        let currentProvider = model.map { "nl-en-rev-\($0.revision)" }
+        var reembedded = 0
+        for index in document.durableFacts.indices {
+            let provider = document.durableFacts[index].embeddingProviderVersion
+            let recognized = provider == "hash-v1" || provider?.hasPrefix("nl-en-rev-") == true
+            if !recognized || (currentProvider != nil && provider != currentProvider) {
+                let updated = Self.makeEmbedding(for: document.durableFacts[index].statement, model: model)
+                document.durableFacts[index].embedding = updated.vector
+                document.durableFacts[index].embeddingProviderVersion = updated.providerVersion
+                reembedded += 1
+            }
+        }
+        migrationStatus = reembedded > 0
+            ? "Restored from Rust ledger; regenerated \(reembedded) vector(s)"
+            : "Restored from Rust ledger"
+        persistenceError = nil
+    }
+
+    /// Keeps the legacy JSON ledger as a fallback only when Rust persistence fails.
+    func configurePersistence(enabled: Bool, persistCurrent: Bool = false) {
+        persistenceEnabled = enabled
+        migrationStatus = enabled ? "Swift JSON fallback active" : "Rust ledger authoritative"
+        if enabled && persistCurrent { persist() }
     }
 
     func diagnostics() async -> MemoryDiagnostics {
@@ -748,6 +806,7 @@ actor SimpleMemoryStore: MemoryStore {
     }
 
     private func persist() {
+        guard persistenceEnabled else { return }
         document.version = Self.schemaVersion
         document.updatedAt = Date()
         do {

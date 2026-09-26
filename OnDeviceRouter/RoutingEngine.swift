@@ -87,7 +87,7 @@ final class RoutingEngine: ObservableObject {
         print("[Debug][Turn \(turnID)] Llama generation started with structured local memory")
 
         let engine = self
-        let text: String
+        var text: String
         do {
             text = try await local.respond(
                 to: query,
@@ -104,6 +104,11 @@ final class RoutingEngine: ObservableObject {
 
         let latencyMs = Int(Date().timeIntervalSince(start) * 1000)
         print("[Debug][Turn \(turnID)] Llama generation complete: \(latencyMs)ms, \(text.count) characters")
+        // Safety net: never hand the user a bare fragment for a statement.
+        if text.split(separator: " ").count <= 3
+            && !query.trimmingCharacters(in: .whitespaces).hasSuffix("?") {
+            text = "Got it, \(text)."
+        }
         let entry = AuditEntry(query: query, decision: decision, latencyMs: latencyMs)
         auditLog.insert(entry, at: 0)
 

@@ -1,8 +1,8 @@
 import Foundation
 import MemlocalCore
 
-/// Keeps Swift authoritative while maintaining a persistent, verified
-/// MemLocal shadow ledger and using its text index for supplemental recall.
+/// Keeps Swift's fact rules while using the verified Rust ledger for durable
+/// persistence, hybrid retrieval, and search seeding for graph expansion.
 @available(iOS 26.0, *)
 actor MemlocalMemoryStore: MemoryStore {
     private let primary: SimpleMemoryStore
@@ -14,7 +14,7 @@ actor MemlocalMemoryStore: MemoryStore {
 
     init(primary: SimpleMemoryStore = SimpleMemoryStore(), databaseURL: URL? = nil) {
         self.primary = primary
-        self.databaseURL = databaseURL ?? Self.ledgerDatabaseURL()
+        self.databaseURL = databaseURL ?? Self.ledgerDatabaseURL(for: primary)
         self.index = nil
     }
 
@@ -29,7 +29,10 @@ actor MemlocalMemoryStore: MemoryStore {
         await primary.ingest(userMessage: userMessage,
                              assistantMessage: assistantMessage,
                              route: route, extractedFacts: extractedFacts)
-        synchronizeLedger(with: await primary.snapshot())
+        let snapshot = await primary.snapshot()
+        if !synchronizeLedger(with: snapshot) {
+            await primary.configurePersistence(enabled: true, persistCurrent: true)
+        }
     }
 
     func snapshot() async -> MemorySnapshot {
@@ -75,33 +78,62 @@ actor MemlocalMemoryStore: MemoryStore {
             factsByID[id].map { SimpleMemoryStore.matchesTopic(of: $0, query: query) } ?? false
         }
         let swiftIDs = swiftRecall.facts.map { $0.id.uuidString }
-        print("[Memory][HybridShadow] provider=\(queryEmbedding.providerVersion) swift=\(swiftIDs) raw=\(rawHybridIDs) topicEligible=\(eligibleHybridIDs) match=\(Set(swiftIDs) == Set(eligibleHybridIDs))")
-        var facts = swiftRecall.facts
-        var selectedIDs = Set(facts.map(\.id))
-        var supplementalIDs = Set<UUID>()
+        print("[Memory][HybridRecall] provider=\(queryEmbedding.providerVersion) swift=\(swiftIDs) raw=\(rawHybridIDs) topicEligible=\(eligibleHybridIDs) match=\(Set(swiftIDs) == Set(eligibleHybridIDs))")
         let resultLimit = max(1, min(limit, 8))
+        var facts: [DurableFact] = []
+        var selectedIDs = Set<UUID>()
+
+        func append(_ fact: DurableFact) {
+            guard facts.count < resultLimit,
+                  SimpleMemoryStore.matchesTopic(of: fact, query: query),
+                  selectedIDs.insert(fact.id).inserted else { return }
+            facts.append(fact)
+        }
+
+        // Hybrid results now lead factual recall. Keep the topic filter on every
+        // Rust-sourced candidate before it can enter the model context.
+        let graphSeedLimit = max(1, min(3, resultLimit - 1))
+        let graphSeedIDs = Array(eligibleHybridIDs.prefix(graphSeedLimit))
+        for id in graphSeedIDs {
+            if let fact = factsByID[id] { append(fact) }
+        }
+
+        // Use the Rust hits as seeds for the existing, validated two-hop graph.
+        let graphSeeds = graphSeedIDs.compactMap(UUID.init(uuidString:))
+        let graphFacts = await primary.graphExpansion(from: graphSeeds, maxHops: 2)
+        for fact in graphFacts { append(fact) }
+
+        for id in eligibleHybridIDs.dropFirst(graphSeedIDs.count) {
+            if let fact = factsByID[id] { append(fact) }
+        }
+
+        // Preserve Swift's lexical/entity candidates as fallback when hybrid
+        // search or the topic filter yields fewer than the requested results.
+        for fact in swiftRecall.facts { append(fact) }
 
         for id in index.search(query: query, limit: max(resultLimit * 2, 8)) {
-            guard let fact = factsByID[id],
-                  SimpleMemoryStore.matchesTopic(of: fact, query: query),
-                  selectedIDs.insert(fact.id).inserted else { continue }
-            facts.append(fact)
-            supplementalIDs.insert(fact.id)
+            guard let fact = factsByID[id] else { continue }
+            append(fact)
             if facts.count >= resultLimit { break }
         }
 
-        guard !supplementalIDs.isEmpty else { return swiftRecall }
-        await primary.recordExternalRecall(supplementalIDs)
+        let swiftIDSet = Set(swiftRecall.facts.map(\.id))
+        let externallySelected = selectedIDs.subtracting(swiftIDSet)
+        await primary.recordExternalRecall(externallySelected)
+        let latestSnapshot = await primary.snapshot()
+        if !synchronizeLedger(with: latestSnapshot) {
+            await primary.configurePersistence(enabled: true, persistCurrent: true)
+        }
 
         var relationshipsByID = Dictionary(uniqueKeysWithValues: swiftRecall.relationships.map {
             ($0.id, $0)
         })
-        for relationship in snapshot.relationships
+        for relationship in latestSnapshot.relationships
         where relationship.isActive && selectedIDs.contains(relationship.sourceFactID) {
             relationshipsByID[relationship.id] = relationship
         }
 
-        print("[Memory][Memlocal] added \(supplementalIDs.count) text-search result(s)")
+        print("[Memory][Memlocal] recalled \(facts.count) fact(s); Rust additions=\(externallySelected.count), graph seeds=\(graphSeeds.count)")
         return MemoryRecall(
             facts: facts,
             episodes: swiftRecall.episodes,
@@ -116,12 +148,38 @@ actor MemlocalMemoryStore: MemoryStore {
 
     func diagnostics() async -> MemoryDiagnostics {
         await ensureIndexIsHydrated()
-        return await primary.diagnostics()
+        var diagnostics = await primary.diagnostics()
+        if isIndexAvailable,
+           !synchronizeLedger(with: await primary.snapshot()) {
+            await primary.configurePersistence(enabled: true, persistCurrent: true)
+            diagnostics = await primary.diagnostics()
+        }
+        guard isIndexAvailable else {
+            let errors = [indexFailure, diagnostics.persistenceError]
+                .compactMap { $0 }.joined(separator: "; ")
+            return diagnostics.replacingPersistence(
+                path: diagnostics.filePath,
+                exists: diagnostics.fileExists,
+                size: diagnostics.fileSizeBytes,
+                error: errors.isEmpty ? nil : errors
+            )
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: databaseURL.path)
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        return diagnostics.replacingPersistence(
+            path: databaseURL.path,
+            exists: FileManager.default.fileExists(atPath: databaseURL.path),
+            size: size,
+            error: nil
+        )
     }
 
     func clear() async {
         await ensureIndexIsHydrated()
         await primary.clear()
+        // Persist an empty fallback before removing Rust's old canonical ledger.
+        await primary.configurePersistence(enabled: true, persistCurrent: true)
+        _ = synchronizeLedger(with: await primary.snapshot())
         index?.close()
         index = nil
         do {
@@ -157,18 +215,31 @@ actor MemlocalMemoryStore: MemoryStore {
             guard let json = String(data: data, encoding: .utf8) else {
                 throw LedgerShadowError.invalidUTF8
             }
-            let verified = try Self.openVerifiedLedger(envelope: envelope, json: json, databaseURL: databaseURL)
+            let (verified, rustEnvelope) = try Self.openLedgerPreferringRust(
+                envelope: envelope, json: json, databaseURL: databaseURL
+            )
+            let restoringRustSource = !rustEnvelope.matchesExport(envelope)
+            if restoringRustSource {
+                await primary.restoreLedger(try rustEnvelope.makeSnapshot())
+            }
             index = verified
             indexFailure = nil
-            print("[Memory][Memlocal] persistent ledger ready; records=\(envelope.records.count)")
+            await primary.configurePersistence(enabled: false)
+            if restoringRustSource,
+               !synchronizeLedger(with: await primary.snapshot()) {
+                await primary.configurePersistence(enabled: true, persistCurrent: true)
+            }
+            if isIndexAvailable {
+                print("[Memory][Memlocal] Rust ledger authoritative; records=\(rustEnvelope.records.count)")
+            }
         } catch {
             disableIndex(error.localizedDescription)
         }
         didHydrateIndex = true
     }
 
-    private func synchronizeLedger(with snapshot: MemorySnapshot) {
-        guard isIndexAvailable, let index else { return }
+    private func synchronizeLedger(with snapshot: MemorySnapshot) -> Bool {
+        guard isIndexAvailable, let index else { return false }
         do {
             let envelope = try MemoryLedgerTransferEnvelope(snapshot: snapshot)
             let encoder = JSONEncoder()
@@ -178,8 +249,8 @@ actor MemlocalMemoryStore: MemoryStore {
                 throw LedgerShadowError.invalidUTF8
             }
             guard index.syncLedger(json) else {
-                disableIndex(index.lastError ?? "ledger synchronization failed")
-                return
+                disableAndDiscardIndex(index.lastError ?? "ledger synchronization failed")
+                return false
             }
             let exported = index.exportLedger()
             guard envelope.matchesExport(exported) else {
@@ -189,11 +260,60 @@ actor MemlocalMemoryStore: MemoryStore {
                 self.index = try Self.openVerifiedLedger(envelope: envelope, json: json, databaseURL: databaseURL)
                 indexFailure = nil
                 print("[Memory][Memlocal] shadow rebuilt and verified; records=\(envelope.records.count)")
-                return
+                return true
             }
+            return true
         } catch {
-            disableIndex(error.localizedDescription)
+            disableAndDiscardIndex(error.localizedDescription)
+            return false
         }
+    }
+
+    private nonisolated static func openLedgerPreferringRust(
+        envelope: MemoryLedgerTransferEnvelope,
+        json: String,
+        databaseURL: URL
+    ) throws -> (MemlocalSearchIndex, MemoryLedgerTransferEnvelope) {
+        let databaseAlreadyExists = [databaseURL.path, databaseURL.path + "-wal", databaseURL.path + "-shm"]
+            .contains { FileManager.default.fileExists(atPath: $0) }
+        let existing = MemlocalSearchIndex(databaseURL: databaseURL)
+        guard existing.isAvailable else {
+            let error = existing.initializationError ?? "unknown Rust database initialization error"
+            existing.close()
+            guard !databaseAlreadyExists else { throw LedgerShadowError.memlocal(error) }
+            let bootstrapped = try openVerifiedLedger(
+                envelope: envelope, json: json, databaseURL: databaseURL
+            )
+            guard let exported = bootstrapped.exportLedger(), envelope.matchesExport(exported) else {
+                bootstrapped.close()
+                throw LedgerShadowError.mismatch("Rust bootstrap did not preserve the source ledger")
+            }
+            return (bootstrapped, exported)
+        }
+
+        guard let rustEnvelope = existing.exportLedger() else {
+            let error = existing.lastError ?? "Rust ledger export failed"
+            existing.close()
+            throw LedgerShadowError.memlocal(error)
+        }
+        if !rustEnvelope.records.isEmpty {
+            guard (try? rustEnvelope.makeSnapshot()) != nil else {
+                existing.close()
+                throw LedgerShadowError.mismatch("Existing Rust ledger payloads could not be restored")
+            }
+            return (existing, rustEnvelope)
+        }
+        existing.close()
+
+        let bootstrapped = try openVerifiedLedger(
+            envelope: envelope, json: json, databaseURL: databaseURL
+        )
+        guard let rustEnvelope = bootstrapped.exportLedger(),
+              envelope.matchesExport(rustEnvelope) else {
+            bootstrapped.close()
+            throw LedgerShadowError.mismatch("Rust bootstrap did not preserve the source ledger")
+        }
+        return (bootstrapped, rustEnvelope)
     }
 
     private nonisolated static func openVerifiedLedger(
@@ -241,8 +361,7 @@ actor MemlocalMemoryStore: MemoryStore {
         do {
             return try attempt(recreate: false)
         } catch {
-            // The Swift JSON ledger remains canonical. A failed Rust shadow is
-            // disposable, so rebuild it from the complete current snapshot.
+            // A failed Rust database can be recreated from the recovery snapshot.
             return try attempt(recreate: true)
         }
     }
@@ -251,6 +370,12 @@ actor MemlocalMemoryStore: MemoryStore {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MemLocal", isDirectory: true)
             .appendingPathComponent("router-ledger.sqlite")
+    }
+
+    private nonisolated static func ledgerDatabaseURL(for primary: SimpleMemoryStore) -> URL {
+        guard !primary.usesDefaultPersistenceFile else { return ledgerDatabaseURL() }
+        let sourceURL = URL(fileURLWithPath: primary.persistenceFilePath)
+        return sourceURL.deletingPathExtension().appendingPathExtension("memlocal.sqlite")
     }
 
     private nonisolated static func mismatchSummary(
@@ -286,7 +411,16 @@ actor MemlocalMemoryStore: MemoryStore {
         indexFailure = error
         index?.close()
         index = nil
-        print("[Memory][Memlocal] disabled; using Swift retrieval: \(error)")
+        print("[Memory][Memlocal] disabled; using Swift fallback: \(error)")
+    }
+
+    private func disableAndDiscardIndex(_ error: String) {
+        disableIndex(error)
+        do {
+            try Self.removeLedgerDatabaseFiles(at: databaseURL)
+        } catch {
+            indexFailure = "\(indexFailure ?? error.localizedDescription); could not discard stale Rust ledger: \(error.localizedDescription)"
+        }
     }
 }
 

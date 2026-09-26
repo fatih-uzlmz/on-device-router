@@ -1,34 +1,35 @@
 # MemLocal iOS integration
 
-The app keeps `SimpleMemoryStore` as its canonical JSON-backed ledger. The
-MemLocal adapter mirrors the complete ledger into a persistent Rust shadow
-database and can add BM25 matches from active durable facts to Swift recall
-when the Swift store returns fewer facts than requested. The shadow is checked
-against the Swift snapshot before and after reopening it during startup.
+The app uses the persistent Rust ledger as its durable source of truth after
+startup verification. An existing Rust ledger is restored into the in-memory
+Swift fact engine; an empty database is bootstrapped from the legacy
+`SimpleMemoryStore` JSON file. Swift JSON persistence is disabled while Rust is
+healthy. If a Rust ledger write fails, the current snapshot is saved to JSON
+and the stale Rust database is discarded so the app can recover on the next
+launch.
 
 The on-device MLX model extracts proposed atomic facts and triples after each
-answer. Swift validates their exact user evidence, matches corrections against
-active facts, invalidates replaced values, and persists facts and source
-messages before the next turn. Recent conversation evidence and durable fact
-sources are included in recall. Swift also handles embeddings, graph links,
-episodes, migration, and diagnostics. Deterministic extraction remains a
-fallback for the phrases it recognizes.
+answer. Swift validates their exact user evidence, merges duplicates, matches
+corrections against active facts, invalidates replaced values, and sends the
+complete record snapshot to Rust before the next turn. Recent conversation
+evidence and durable fact sources are included in recall. Swift also handles
+embeddings, graph links, episodes, and legacy JSON migration. Deterministic
+extraction remains a fallback for the phrases it recognizes.
 
 The Rust source and Swift adapter include a versioned full-snapshot sync and
 export API. Each row keeps its original Swift record JSON intact alongside
 Rust text and vector projections. Original on-device fact embeddings are
 projected into a fixed 128-dimensional Rust index; hybrid search accepts query
 vectors through the C bridge and compares only matching provider revisions,
-source dimensions, and projection versions. Hybrid runs during recall in
-shadow mode, logging raw and Swift-topic-eligible IDs without using them. The app has not switched
-recall to Rust hybrid or graph search. Swift remains
-the authoritative writer during this migration stage. The rebuilt checked-in
-XCFramework contains the ledger and embedding bridge symbols.
+source dimensions, and projection versions. Hybrid result IDs now lead recall
+only after Swift's mandatory topic filter. Those seed IDs expand through the
+Swift ledger's relationship graph for up to two hops; Swift lexical/entity
+recall remains a fallback. The checked-in XCFramework contains the ledger and
+embedding bridge symbols.
 
 See `LEDGER_CONTRACT.md` for the record fields, evidence rules, and migration
-checks. Rust import requires an empty shadow database; discard an incomplete
-database and retry from the Swift snapshot rather than importing twice into a
-partially populated store.
+checks. If startup cannot validate the existing Rust database, the adapter
+rebuilds it from the current recovery snapshot.
 
 The Rust core is vendored at the revision in `UPSTREAM_REVISION` under its
 Apache-2.0 license. The `http` feature is disabled. The checked-in
