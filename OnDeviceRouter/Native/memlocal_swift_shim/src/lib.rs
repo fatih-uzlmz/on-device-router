@@ -228,11 +228,17 @@ pub extern "C" fn memlocal_search_router_hybrid(
         }
         let query = read_c_string(query)?;
         let embedding_json = read_c_string(embedding_json)?;
-        let embedding: Vec<f64> = serde_json::from_str(&embedding_json)
+        let embedding: serde_json::Value = serde_json::from_str(&embedding_json)
             .map_err(|error| format!("invalid query embedding JSON: {error}"))?;
+        let vector: Vec<f64> = serde_json::from_value(embedding.get("vector").cloned()
+            .ok_or("missing query vector")?)
+            .map_err(|error| format!("invalid query vector: {error}"))?;
+        let provider_version = embedding.get("providerVersion")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing query provider version")?;
         let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
         let items = engine
-            .search_router_facts_hybrid(&query, &embedding, k as usize)
+            .search_router_facts_hybrid(&query, &vector, provider_version, k as usize)
             .map_err(|error| error.to_string())?;
         let json = serde_json::to_string(&items).map_err(|error| error.to_string())?;
         let result = CString::new(json).map_err(|error| error.to_string())?;

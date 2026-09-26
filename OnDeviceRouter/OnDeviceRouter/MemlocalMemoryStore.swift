@@ -34,6 +34,28 @@ actor MemlocalMemoryStore: MemoryStore {
         await primary.snapshot()
     }
 
+    /// Read-only evaluation hook for the shadow promotion gate.
+    func shadowHybridIDs(matching query: String, limit: Int) async -> [String] {
+        await ensureIndexIsHydrated()
+        guard isIndexAvailable, let index else { return [] }
+        let embedding = await primary.queryEmbedding(for: query)
+        let rawIDs = index.searchHybrid(query: query, embedding: embedding.vector,
+                                        providerVersion: embedding.providerVersion, limit: limit)
+        let factsByID = Dictionary(uniqueKeysWithValues: await primary.snapshot().durableFacts.map {
+            ($0.id.uuidString, $0)
+        })
+        let eligibleIDs = rawIDs.filter { id in
+            factsByID[id].map { SimpleMemoryStore.matchesTopic(of: $0, query: query) } ?? false
+        }
+        print("[Memory][HybridShadow] raw=\(rawIDs) topicEligible=\(eligibleIDs)")
+        return eligibleIDs
+    }
+
+    func shadowIndexIsAvailable() async -> Bool {
+        await ensureIndexIsHydrated()
+        return isIndexAvailable
+    }
+
     func recall(matching query: String, limit: Int) async -> MemoryRecall {
         await ensureIndexIsHydrated()
         let swiftRecall = await primary.recall(matching: query, limit: limit)
@@ -43,6 +65,15 @@ actor MemlocalMemoryStore: MemoryStore {
         let factsByID = Dictionary(uniqueKeysWithValues: snapshot.durableFacts.map {
             ($0.id.uuidString, $0)
         })
+        let queryEmbedding = await primary.queryEmbedding(for: query)
+        let rawHybridIDs = index.searchHybrid(query: query, embedding: queryEmbedding.vector,
+                                              providerVersion: queryEmbedding.providerVersion,
+                                              limit: max(1, min(limit, 8)))
+        let eligibleHybridIDs = rawHybridIDs.filter { id in
+            factsByID[id].map { SimpleMemoryStore.matchesTopic(of: $0, query: query) } ?? false
+        }
+        let swiftIDs = swiftRecall.facts.map { $0.id.uuidString }
+        print("[Memory][HybridShadow] provider=\(queryEmbedding.providerVersion) swift=\(swiftIDs) raw=\(rawHybridIDs) topicEligible=\(eligibleHybridIDs) match=\(Set(swiftIDs) == Set(eligibleHybridIDs))")
         var facts = swiftRecall.facts
         var selectedIDs = Set(facts.map(\.id))
         var supplementalIDs = Set<UUID>()
@@ -246,6 +277,11 @@ private enum LedgerShadowError: LocalizedError {
     }
 }
 
+nonisolated private struct RouterHybridEmbedding: Encodable {
+    let vector: [Double]
+    let providerVersion: String
+}
+
 /// Synchronous, actor-confined owner of the C ABI handle.
 nonisolated private final class MemlocalSearchIndex {
     private let config: String
@@ -322,9 +358,10 @@ nonisolated private final class MemlocalSearchIndex {
         return results.map(\.id)
     }
 
-    func searchHybrid(query: String, embedding: [Double], limit: Int) -> [String] {
+    func searchHybrid(query: String, embedding: [Double], providerVersion: String, limit: Int) -> [String] {
         guard let handle else { return [] }
-        guard let data = try? JSONEncoder().encode(embedding),
+        let request = RouterHybridEmbedding(vector: embedding, providerVersion: providerVersion)
+        guard let data = try? JSONEncoder().encode(request),
               let embeddingJSON = String(data: data, encoding: .utf8) else {
             lastError = "Could not encode the on-device query embedding"
             return []

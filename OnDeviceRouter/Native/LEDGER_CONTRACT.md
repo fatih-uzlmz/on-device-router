@@ -2,7 +2,7 @@
 
 This contract defines the records that the Swift JSON ledger and its persistent
 Rust shadow must preserve. It is the compatibility boundary for the shadow
-migration. The current Swift document is schema version 2.
+migration. The current Swift document is schema version 3.
 
 ## Records
 
@@ -41,17 +41,24 @@ derived retrieval data and may be rebuilt from the ledger records.
 
 Embeddings are derived indexes, not the source of truth. The Swift store may
 contain NaturalLanguage vectors or 128-element hashed fallback vectors. Keep
-those original vectors intact in `payloadJSON`; project them into the Rust
-index's fixed 128-dimensional space using the versioned signed-feature hash.
-Store each source vector's dimension with the derived index row. Rust hybrid
-search applies the same projection to the query and uses vectors only when the
-stored source dimension matches the query dimension. The normal app recall path
-does not switch to Rust in this step.
+those original vectors and `embeddingProviderVersion` in `payloadJSON`.
+NaturalLanguage vectors use `nl-en-rev-<revision>`; the fallback uses `hash-v1`.
+On load, Swift regenerates unknown vectors and regenerates older revisions or
+hashed vectors when the current NaturalLanguage model is available. Hashed
+facts are text-search-only until then. Rust projects vectors into its fixed
+128-dimensional index, but hybrid search compares them only when provider
+version, source dimension, and projection version all match. Hybrid runs in
+shadow mode and logs raw IDs, IDs eligible under Swift's existing topic rule,
+and Swift recall IDs. The topic rule remains part of the candidate path.
+
+Promotion gate: Rust hybrid must match or beat Swift recall on paraphrase,
+correction, contradiction, and irrelevant-fact rejection before its results
+can enter recall. Swift remains the authoritative writer throughout.
 
 ## Migration and ownership
 
 - The transfer envelope uses format `on-device-router-ledger`, transfer
-  schema version 1, and Swift ledger schema version 2. It sorts records by kind
+  schema version 1, and Swift ledger schema version 3. It sorts records by kind
   and stable ID. Each row carries an indexable text projection and dates in
   Unix seconds; `payloadJSON` carries the complete sorted-key Swift record.
 - Rust stores and exports each `payloadJSON` string intact. The wrapper fields

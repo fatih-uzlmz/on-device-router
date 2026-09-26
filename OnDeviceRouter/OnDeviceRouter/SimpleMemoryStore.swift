@@ -8,7 +8,7 @@ import NaturalLanguage
 /// for durable storage. The app-level MemLocal adapter only indexes active facts.
 @available(iOS 26.0, *)
 actor SimpleMemoryStore: MemoryStore {
-    nonisolated private static let schemaVersion = 2
+    nonisolated private static let schemaVersion = 3
     nonisolated private static let durableCapacity = 200
     nonisolated private static let invalidatedCapacity = 100
     nonisolated private static let relationshipCapacity = 400
@@ -84,15 +84,32 @@ actor SimpleMemoryStore: MemoryStore {
         let resolvedURL = fileURL ?? Self.storeURL(fileName: "memories.json")
         let loaded = Self.load(from: resolvedURL)
         self.fileURL = resolvedURL
-        self.document = loaded.document
-        self.migrationStatus = loaded.status
+        var migrated = loaded.document
+        let model = NLEmbedding.sentenceEmbedding(for: .english)
+        var reembedded = 0
+        let currentProvider = model.map { "nl-en-rev-\($0.revision)" }
+        for index in migrated.durableFacts.indices {
+            let provider = migrated.durableFacts[index].embeddingProviderVersion
+            let recognized = provider == "hash-v1" || provider?.hasPrefix("nl-en-rev-") == true
+            if !recognized || (currentProvider != nil && provider != currentProvider) {
+                let updated = Self.makeEmbedding(for: migrated.durableFacts[index].statement, model: model)
+                migrated.durableFacts[index].embedding = updated.vector
+                migrated.durableFacts[index].embeddingProviderVersion = updated.providerVersion
+                reembedded += 1
+            }
+        }
+        if loaded.shouldPersist || reembedded > 0 {
+            migrated.version = Self.schemaVersion
+        }
+        self.document = migrated
+        self.migrationStatus = reembedded > 0 ? "\(loaded.status); regenerated \(reembedded) vector(s)" : loaded.status
         self.persistenceError = loaded.error
         self.sentenceEmbedding = nil
 
-        if loaded.shouldPersist {
-            Self.write(document: loaded.document, to: resolvedURL)
+        if loaded.shouldPersist || reembedded > 0 {
+            Self.write(document: migrated, to: resolvedURL)
         }
-        print("[Memory] \(loaded.status); facts=\(loaded.document.durableFacts.filter(\.isActive).count), turns=\(loaded.document.conversationTurns.count)")
+        print("[Memory] \(loaded.status); re-embedded=\(reembedded); facts=\(migrated.durableFacts.filter(\.isActive).count), turns=\(migrated.conversationTurns.count)")
     }
 
     func ingest(userMessage: String, assistantMessage: String, route: String) async {
@@ -210,9 +227,11 @@ actor SimpleMemoryStore: MemoryStore {
             let lexical = bm25Score(documentText: fact.statement + " " + fact.sources.map(\.text).joined(separator: " "),
                                     queryTerms: terms,
                                     corpus: activeFacts)
-            let semantic = Self.cosine(queryEmbedding.vector, fact.embedding)
+            let comparable = queryEmbedding.providerVersion.hasPrefix("nl-en-rev-")
+                && queryEmbedding.providerVersion == fact.embeddingProviderVersion
+            let semantic = comparable ? Self.cosine(queryEmbedding.vector, fact.embedding) : 0
             let entity = Self.entityScore(fact.triple, queryTerms: terms)
-            let qualifies = lexical > 0 || entity > 0 || (queryEmbedding.isSemantic && semantic >= 0.72)
+            let qualifies = lexical > 0 || entity > 0 || (comparable && semantic >= 0.72)
             guard qualifies else { return nil }
 
             let ageDays = max(0, Date().timeIntervalSince(fact.updatedAt) / 86_400)
@@ -369,6 +388,7 @@ actor SimpleMemoryStore: MemoryStore {
         }
 
         let factID = UUID()
+        let factEmbedding = embedding(for: extracted.statement)
         let fact = DurableFact(
             id: factID,
             triple: extracted.triple,
@@ -382,7 +402,8 @@ actor SimpleMemoryStore: MemoryStore {
             accessCount: 0,
             lastAccessedAt: nil,
             importance: extracted.importance,
-            embedding: embedding(for: extracted.statement).vector,
+            embedding: factEmbedding.vector,
+            embeddingProviderVersion: factEmbedding.providerVersion,
             relatedFactIDs: []
         )
         document.durableFacts.append(fact)
@@ -649,14 +670,22 @@ actor SimpleMemoryStore: MemoryStore {
 
     // MARK: - Embeddings
 
-    private func embedding(for text: String) -> (vector: [Double], isSemantic: Bool) {
+    func queryEmbedding(for text: String) -> (vector: [Double], providerVersion: String) {
+        embedding(for: text)
+    }
+
+    private func embedding(for text: String) -> (vector: [Double], providerVersion: String) {
         if sentenceEmbedding == nil {
             sentenceEmbedding = NLEmbedding.sentenceEmbedding(for: .english)
         }
-        if let vector = sentenceEmbedding?.vector(for: text), !vector.isEmpty {
-            return (Self.normalizedVector(vector), true)
+        return Self.makeEmbedding(for: text, model: sentenceEmbedding)
+    }
+
+    nonisolated private static func makeEmbedding(for text: String, model: NLEmbedding?) -> (vector: [Double], providerVersion: String) {
+        if let model, let vector = model.vector(for: text), !vector.isEmpty {
+            return (normalizedVector(vector), "nl-en-rev-\(model.revision)")
         }
-        return (Self.hashedEmbedding(for: text, dimensions: 128), false)
+        return (hashedEmbedding(for: text, dimensions: 128), "hash-v1")
     }
 
     nonisolated private static func hashedEmbedding(for text: String, dimensions: Int) -> [Double] {
@@ -787,7 +816,8 @@ actor SimpleMemoryStore: MemoryStore {
                     createdAt: exchange.timestamp, updatedAt: exchange.timestamp,
                     invalidatedAt: nil, confidence: 0.9, reinforcementCount: 1,
                     accessCount: 0, lastAccessedAt: nil, importance: extracted.importance,
-                    embedding: hashedEmbedding(for: extracted.statement, dimensions: 128), relatedFactIDs: []
+                    embedding: hashedEmbedding(for: extracted.statement, dimensions: 128),
+                    embeddingProviderVersion: "hash-v1", relatedFactIDs: []
                 ))
                 for triple in uniqueTriples([extracted.triple] + extracted.relationships) {
                     result.relationships.append(EntityRelationship(

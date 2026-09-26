@@ -18,8 +18,10 @@ The Rust source and Swift adapter include a versioned full-snapshot sync and
 export API. Each row keeps its original Swift record JSON intact alongside
 Rust text and vector projections. Original on-device fact embeddings are
 projected into a fixed 128-dimensional Rust index; hybrid search accepts query
-vectors through the C bridge and matches only compatible source dimensions.
-The app has not switched recall to Rust hybrid or graph search. Swift remains
+vectors through the C bridge and compares only matching provider revisions,
+source dimensions, and projection versions. Hybrid runs during recall in
+shadow mode, logging raw and Swift-topic-eligible IDs without using them. The app has not switched
+recall to Rust hybrid or graph search. Swift remains
 the authoritative writer during this migration stage. The rebuilt checked-in
 XCFramework contains the ledger and embedding bridge symbols.
 

@@ -27,13 +27,14 @@ pub struct RouterLedgerRecord {
     pub created_at: f64,
     pub updated_at: f64,
     pub invalidated_at: Option<f64>,
+    #[serde(rename = "payloadJSON", alias = "payloadJson")]
     pub payload_json: String,
 }
 
 impl RouterLedgerEnvelope {
     pub const FORMAT: &'static str = "on-device-router-ledger";
     pub const SCHEMA_VERSION: u32 = 1;
-    pub const SOURCE_SCHEMA_VERSION: u32 = 2;
+    pub const SOURCE_SCHEMA_VERSION: u32 = 3;
 
     pub fn empty() -> Self {
         Self {

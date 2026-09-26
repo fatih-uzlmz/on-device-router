@@ -306,6 +306,15 @@ fn prepare_router_ledger(
             embedding_dimensions as usize,
             &record.id,
         )?;
+        let provider_version = payload.get("embeddingProviderVersion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        if matches!(record.kind.as_str(), "durableFact" | "invalidatedFact")
+            && provider_version.is_none() {
+            return Err(crate::error::MemlocalError::InvalidArgument(format!(
+                "missing embedding provider version for ledger record {}", record.id
+            )));
+        }
         let mut item = MemoryItem::new(record.content.clone(), memory_type);
         item.id.clone_from(&record.id);
         item.created_at = created_at;
@@ -316,6 +325,7 @@ fn prepare_router_ledger(
         item.metadata = serde_json::json!({
             "on_device_router_record": serde_json::to_string(record)?,
             "on_device_router_embedding_source_dimensions": source_embedding_dimensions,
+            "on_device_router_embedding_provider_version": provider_version,
             "on_device_router_embedding_projection_version": ROUTER_LEDGER_EMBEDDING_PROJECTION_VERSION
         });
         prepared.push((record.clone(), item, embedding));
@@ -571,9 +581,12 @@ impl MemlocalEngine {
         &self,
         query: &str,
         query_embedding: &[f64],
+        query_provider_version: &str,
         k: usize,
     ) -> Result<Vec<MemoryItem>> {
-        if k == 0 || query_embedding.is_empty() {
+        // Hashed fallback facts are text-only; a semantic query requires the
+        // exact NaturalLanguage model revision recorded with each vector.
+        if k == 0 || query_embedding.is_empty() || !query_provider_version.starts_with("nl-en-rev-") {
             return Ok(Vec::new());
         }
         let projected = project_router_embedding(
@@ -588,10 +601,7 @@ impl MemlocalEngine {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let mut matches =
-            self.store
-                .search_hybrid(query, &projected, count, None, Some(MemoryType::Factual))?;
-        matches.retain(|item| {
+        let compatible = |item: &MemoryItem| {
             let Some(record_json) = item
                 .metadata
                 .get("on_device_router_record")
@@ -604,6 +614,10 @@ impl MemlocalEngine {
             };
             record.kind == "durableFact"
                 && record.invalidated_at.is_none()
+                && item.metadata
+                    .get("on_device_router_embedding_provider_version")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(query_provider_version)
                 && item
                     .metadata
                     .get("on_device_router_embedding_source_dimensions")
@@ -614,9 +628,39 @@ impl MemlocalEngine {
                     .get("on_device_router_embedding_projection_version")
                     .and_then(serde_json::Value::as_u64)
                     == Some(ROUTER_LEDGER_EMBEDDING_PROJECTION_VERSION)
-        });
-        matches.truncate(k);
-        Ok(matches)
+        };
+        // The shared vector index contains every provider. Compare only
+        // compatible router rows so another provider cannot affect ranking.
+        let mut semantic = Vec::<(MemoryItem, f64)>::new();
+        for item in self.store.get_memories(None, None, count)? {
+            if !compatible(&item) { continue; }
+            let Some(record_json) = item.metadata.get("on_device_router_record").and_then(serde_json::Value::as_str) else { continue; };
+            let record: RouterLedgerRecord = serde_json::from_str(record_json)?;
+            let payload: serde_json::Value = serde_json::from_str(&record.payload_json)?;
+            let source = payload.get("embedding").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| crate::error::MemlocalError::InvalidArgument("missing fact embedding".into()))?;
+            let values = source.iter().map(|value| value.as_f64().ok_or_else(||
+                crate::error::MemlocalError::InvalidArgument("invalid fact embedding".into())))
+                .collect::<Result<Vec<_>>>()?;
+            let vector = project_router_embedding(&values, projected.len(), &record.id)?;
+            let similarity: f64 = projected.iter().zip(vector.iter())
+                .map(|(left, right)| f64::from(*left) * f64::from(*right)).sum();
+            semantic.push((item, similarity));
+        }
+        semantic.sort_by(|left, right| right.1.total_cmp(&left.1));
+        let lexical = self.store.search_text(query, count)?;
+        let mut scores = std::collections::HashMap::<String, (MemoryItem, f64)>::new();
+        for (rank, (item, _)) in semantic.into_iter().enumerate() {
+            let entry = scores.entry(item.id.clone()).or_insert((item, 0.0));
+            entry.1 += 1.0 / (60.0 + rank as f64 + 1.0);
+        }
+        for (rank, item) in lexical.into_iter().filter(&compatible).enumerate() {
+            let entry = scores.entry(item.id.clone()).or_insert((item, 0.0));
+            entry.1 += 1.0 / (60.0 + rank as f64 + 1.0);
+        }
+        let mut ranked: Vec<_> = scores.into_values().collect();
+        ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.id.cmp(&right.0.id)));
+        Ok(ranked.into_iter().take(k).map(|(item, score)| item.with_score(score)).collect())
     }
 
     pub fn search_hybrid(
@@ -888,6 +932,7 @@ mod router_ledger_tests {
                     "updatedAt": updated_at,
                     "invalidatedAt": null,
                     "embedding": [0.5, 0.2, 0.3, 0.4],
+                    "embeddingProviderVersion": "nl-en-rev-1",
                     "sources": [{"text": "I live in Toronto", "timestamp": created_at}]
                 }),
             ),
@@ -904,6 +949,7 @@ mod router_ledger_tests {
                     "updatedAt": updated_at,
                     "invalidatedAt": invalidated_at,
                     "embedding": [0.5, 0.2, 0.3, 0.4],
+                    "embeddingProviderVersion": "nl-en-rev-1",
                     "sources": []
                 }),
             ),
@@ -996,12 +1042,20 @@ mod router_ledger_tests {
             assert_eq!(facts[0].content, "User lives in Toronto.");
 
             let hybrid = engine
-                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], 10)
+                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], "nl-en-rev-1", 10)
                 .unwrap();
             assert_eq!(hybrid.len(), 1);
             assert_eq!(hybrid[0].content, "User lives in Toronto.");
             assert!(engine
-                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4, 0.1], 10)
+                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4, 0.1], "nl-en-rev-1", 10)
+                .unwrap()
+                .is_empty());
+            assert!(engine
+                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], "nl-en-rev-2", 10)
+                .unwrap()
+                .is_empty());
+            assert!(engine
+                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], "hash-v1", 10)
                 .unwrap()
                 .is_empty());
             engine.close().unwrap();
@@ -1012,7 +1066,7 @@ mod router_ledger_tests {
             assert_eq!(reopened.memory_count(None).unwrap(), envelope.records.len());
             assert_eq!(reopened.export_router_ledger().unwrap(), envelope);
             let hybrid = reopened
-                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], 10)
+                .search_router_facts_hybrid("Toronto", &[0.5, 0.2, 0.3, 0.4], "nl-en-rev-1", 10)
                 .unwrap();
             assert_eq!(hybrid.len(), 1);
             assert_eq!(hybrid[0].content, "User lives in Toronto.");

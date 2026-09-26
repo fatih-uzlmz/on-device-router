@@ -33,6 +33,7 @@ nonisolated struct DurableFact: Identifiable, Codable, Hashable, Sendable {
     var lastAccessedAt: Date?
     var importance: Double
     var embedding: [Double]
+    var embeddingProviderVersion: String?
     var relatedFactIDs: [UUID]
 
     var isActive: Bool { invalidatedAt == nil }
@@ -96,7 +97,7 @@ nonisolated struct MemoryLedgerTransferRecord: Codable, Equatable, Sendable {
 
 nonisolated struct MemoryLedgerTransferEnvelope: Codable, Equatable, Sendable {
     static let currentSchemaVersion = 1
-    static let sourceSwiftSchemaVersion = 2
+    static let sourceSwiftSchemaVersion = 3
 
     let format: String
     let schemaVersion: Int
@@ -256,7 +257,7 @@ nonisolated struct MemoryDiagnostics: Sendable {
         episodicCount: 0, temporaryTurnCount: 0, invalidatedFactCount: 0,
         filePath: "", fileExists: false, fileSizeBytes: 0,
         persistenceError: nil, embeddedCount: 0, graphEdgeCount: 0,
-        schemaVersion: 2, migrationStatus: "Not loaded", typeCounts: [:]
+        schemaVersion: 3, migrationStatus: "Not loaded", typeCounts: [:]
     )
 }
 

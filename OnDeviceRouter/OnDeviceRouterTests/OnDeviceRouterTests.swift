@@ -82,8 +82,71 @@ struct OnDeviceRouterTests {
         let diagnostics = await store.diagnostics()
 
         #expect(snapshot.durableFacts.first?.triple.object == "Snow")
-        #expect(diagnostics.schemaVersion == 2)
+        #expect(diagnostics.schemaVersion == 3)
         #expect(diagnostics.migrationStatus.contains("Migrated 1 legacy turn"))
+    }
+
+    @Test func unknownEmbeddingProvenanceIsRegeneratedOnLoad() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let original = SimpleMemoryStore(fileURL: url)
+        await original.ingest(userMessage: "My dog is named Snow", assistantMessage: "OK", route: "local")
+
+        var json = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var facts = try #require(json["durableFacts"] as? [[String: Any]])
+        facts[0].removeValue(forKey: "embeddingProviderVersion")
+        facts[0]["embedding"] = Array(repeating: 1.0, count: 128)
+        json["durableFacts"] = facts
+        json["version"] = 2
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+
+        let reloaded = SimpleMemoryStore(fileURL: url)
+        let fact = try #require(await reloaded.snapshot().durableFacts.first)
+        #expect(fact.embeddingProviderVersion != nil)
+        #expect(fact.embedding != Array(repeating: 1.0, count: 128))
+        #expect(await reloaded.diagnostics().schemaVersion == 3)
+    }
+
+    @Test func hybridShadowEvaluatesFourPromotionCasesWithoutChangingSwiftRecall() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let primary = SimpleMemoryStore(fileURL: url)
+        let shadow = MemlocalMemoryStore(primary: primary)
+        let semanticAvailable = await primary.queryEmbedding(for: "embedding probe")
+            .providerVersion.hasPrefix("nl-en-rev-")
+        var passed = 0
+
+        func evaluate(_ label: String, query: String, expected: String?, forbidden: String? = nil) async {
+            let swift = await primary.recall(matching: query, limit: 5)
+            let rust = await shadow.shadowHybridIDs(matching: query, limit: 5)
+            let facts = await primary.snapshot().durableFacts
+            let rustObjects = rust.compactMap { id in
+                facts.first { $0.id.uuidString == id }?.triple.object
+            }
+            let swiftObjects = swift.facts.map { $0.triple.object }
+            let swiftPass = (expected.map { swiftObjects.contains($0) } ?? swiftObjects.isEmpty)
+                && (forbidden.map { !swiftObjects.contains($0) } ?? true)
+            let rustPass = Set(rust) == Set(swift.facts.map { $0.id.uuidString })
+            if semanticAvailable && rustPass && swiftPass { passed += 1 }
+            print("[Memory][HybridGate] \(label): swift=\(swiftObjects) rust=\(rustObjects) pass=\(semanticAvailable ? String(rustPass && swiftPass) : "unscored-hash-fallback")")
+            #expect(swiftPass)
+            if !semanticAvailable { #expect(rust.isEmpty) }
+        }
+
+        await shadow.ingest(userMessage: "My sister loves chocolate cake", assistantMessage: "OK", route: "local")
+        #expect(await shadow.shadowIndexIsAvailable())
+        await evaluate("paraphrase", query: "What dessert should I buy for my family?", expected: "chocolate cake")
+
+        await shadow.ingest(userMessage: "My favorite programming language is python", assistantMessage: "OK", route: "local")
+        await shadow.ingest(userMessage: "My favorite programming language is Rust", assistantMessage: "OK", route: "local")
+        await evaluate("correction", query: "What's my favorite programming language?", expected: "Rust", forbidden: "python")
+
+        await shadow.ingest(userMessage: "My dog is named Snow", assistantMessage: "OK", route: "local")
+        await shadow.ingest(userMessage: "My dog is named Max", assistantMessage: "OK", route: "local")
+        await evaluate("contradiction", query: "What is my dog's name?", expected: "Max", forbidden: "Snow")
+        await evaluate("irrelevant-fact rejection", query: "What is my cat's name?", expected: nil)
+        print("[Memory][HybridGate] \(semanticAvailable ? "\(passed)/4" : "deferred: NLEmbedding unavailable"); promotion requires 4/4")
+        if semanticAvailable { #expect(passed == 4) }
     }
 
     @Test func deterministicExtractorAcceptsRequiredPhrases() async throws {
