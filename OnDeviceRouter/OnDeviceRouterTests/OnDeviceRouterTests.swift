@@ -110,13 +110,20 @@ struct OnDeviceRouterTests {
     @Test func hybridShadowEvaluatesFourPromotionCasesWithoutChangingSwiftRecall() async throws {
         let url = temporaryMemoryURL()
         defer { try? FileManager.default.removeItem(at: url) }
+        let shadowURL = url.deletingPathExtension().appendingPathExtension("sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: shadowURL.path + suffix)
+            }
+        }
         let primary = SimpleMemoryStore(fileURL: url)
-        let shadow = MemlocalMemoryStore(primary: primary)
+        let shadow = MemlocalMemoryStore(primary: primary, databaseURL: shadowURL)
         let semanticAvailable = await primary.queryEmbedding(for: "embedding probe")
             .providerVersion.hasPrefix("nl-en-rev-")
         var passed = 0
 
         func evaluate(_ label: String, query: String, expected: String?, forbidden: String? = nil) async {
+            #expect(await shadow.shadowIndexIsAvailable())
             let swift = await primary.recall(matching: query, limit: 5)
             let rust = await shadow.shadowHybridIDs(matching: query, limit: 5)
             let facts = await primary.snapshot().durableFacts
@@ -147,6 +154,28 @@ struct OnDeviceRouterTests {
         await evaluate("irrelevant-fact rejection", query: "What is my cat's name?", expected: nil)
         print("[Memory][HybridGate] \(semanticAvailable ? "\(passed)/4" : "deferred: NLEmbedding unavailable"); promotion requires 4/4")
         if semanticAvailable { #expect(passed == 4) }
+    }
+
+    @Test func ledgerVerificationAllowsJSONTimestampRoundingButChecksPayload() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        await store.ingest(userMessage: "My dog is named Snow", assistantMessage: "OK", route: "local")
+        let original = try MemoryLedgerTransferEnvelope(snapshot: await store.snapshot())
+        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
+        var records = try #require(json["records"] as? [[String: Any]])
+        let timestamp = try #require(records.first?["createdAt"] as? Double)
+        records[0]["createdAt"] = timestamp.nextUp
+        json["records"] = records
+        let rounded = try JSONDecoder().decode(MemoryLedgerTransferEnvelope.self,
+                                               from: JSONSerialization.data(withJSONObject: json))
+        #expect(original.matchesExport(rounded))
+
+        records[0]["payloadJSON"] = "{}"
+        json["records"] = records
+        let changed = try JSONDecoder().decode(MemoryLedgerTransferEnvelope.self,
+                                               from: JSONSerialization.data(withJSONObject: json))
+        #expect(!original.matchesExport(changed))
     }
 
     @Test func deterministicExtractorAcceptsRequiredPhrases() async throws {

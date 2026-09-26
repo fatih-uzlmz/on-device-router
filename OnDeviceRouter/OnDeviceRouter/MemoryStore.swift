@@ -104,6 +104,34 @@ nonisolated struct MemoryLedgerTransferEnvelope: Codable, Equatable, Sendable {
     let sourceSchemaVersion: Int
     let records: [MemoryLedgerTransferRecord]
 
+    /// Rust's JSON parser can round a Unix timestamp by one floating-point
+    /// unit when it reads Swift's decimal encoding. The opaque payload remains
+    /// byte-for-byte authoritative, so allow sub-microsecond wrapper drift.
+    func matchesExport(_ other: Self?) -> Bool {
+        guard let other,
+              format == other.format,
+              schemaVersion == other.schemaVersion,
+              sourceSchemaVersion == other.sourceSchemaVersion,
+              records.count == other.records.count else { return false }
+        func sameTime(_ lhs: TimeInterval, _ rhs: TimeInterval) -> Bool {
+            abs(lhs - rhs) < 0.000_001
+        }
+        func sameOptionalTime(_ lhs: TimeInterval?, _ rhs: TimeInterval?) -> Bool {
+            switch (lhs, rhs) {
+            case (nil, nil): return true
+            case let (left?, right?): return sameTime(left, right)
+            default: return false
+            }
+        }
+        return zip(records, other.records).allSatisfy { wanted, found in
+            wanted.kind == found.kind && wanted.id == found.id &&
+            wanted.content == found.content && wanted.payloadJSON == found.payloadJSON &&
+            sameTime(wanted.createdAt, found.createdAt) &&
+            sameTime(wanted.updatedAt, found.updatedAt) &&
+            sameOptionalTime(wanted.invalidatedAt, found.invalidatedAt)
+        }
+    }
+
     init(snapshot: MemorySnapshot) throws {
         let payloadEncoder = JSONEncoder()
         payloadEncoder.outputFormatting = [.sortedKeys]

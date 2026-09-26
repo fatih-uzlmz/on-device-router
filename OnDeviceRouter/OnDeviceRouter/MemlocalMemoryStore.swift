@@ -6,13 +6,15 @@ import MemlocalCore
 @available(iOS 26.0, *)
 actor MemlocalMemoryStore: MemoryStore {
     private let primary: SimpleMemoryStore
+    private let databaseURL: URL
     private var index: MemlocalSearchIndex?
     private var didHydrateIndex = false
     private var hydrationTask: Task<MemorySnapshot, Never>?
     private var indexFailure: String?
 
-    init(primary: SimpleMemoryStore = SimpleMemoryStore()) {
+    init(primary: SimpleMemoryStore = SimpleMemoryStore(), databaseURL: URL? = nil) {
         self.primary = primary
+        self.databaseURL = databaseURL ?? Self.ledgerDatabaseURL()
         self.index = nil
     }
 
@@ -123,7 +125,7 @@ actor MemlocalMemoryStore: MemoryStore {
         index?.close()
         index = nil
         do {
-            try Self.removeLedgerDatabaseFiles()
+            try Self.removeLedgerDatabaseFiles(at: databaseURL)
             indexFailure = nil
             didHydrateIndex = false
             hydrationTask = nil
@@ -155,7 +157,7 @@ actor MemlocalMemoryStore: MemoryStore {
             guard let json = String(data: data, encoding: .utf8) else {
                 throw LedgerShadowError.invalidUTF8
             }
-            let verified = try Self.openVerifiedLedger(envelope: envelope, json: json)
+            let verified = try Self.openVerifiedLedger(envelope: envelope, json: json, databaseURL: databaseURL)
             index = verified
             indexFailure = nil
             print("[Memory][Memlocal] persistent ledger ready; records=\(envelope.records.count)")
@@ -179,8 +181,14 @@ actor MemlocalMemoryStore: MemoryStore {
                 disableIndex(index.lastError ?? "ledger synchronization failed")
                 return
             }
-            guard index.exportLedger() == envelope else {
-                disableIndex("Rust ledger snapshot did not match Swift after synchronization")
+            let exported = index.exportLedger()
+            guard envelope.matchesExport(exported) else {
+                print("[Memory][Memlocal] shadow mismatch after sync; \(Self.mismatchSummary(expected: envelope, actual: exported)), rebuilding")
+                index.close()
+                self.index = nil
+                self.index = try Self.openVerifiedLedger(envelope: envelope, json: json, databaseURL: databaseURL)
+                indexFailure = nil
+                print("[Memory][Memlocal] shadow rebuilt and verified; records=\(envelope.records.count)")
                 return
             }
         } catch {
@@ -190,14 +198,14 @@ actor MemlocalMemoryStore: MemoryStore {
 
     private nonisolated static func openVerifiedLedger(
         envelope: MemoryLedgerTransferEnvelope,
-        json: String
+        json: String,
+        databaseURL: URL
     ) throws -> MemlocalSearchIndex {
-        let databaseURL = ledgerDatabaseURL()
         let parent = databaseURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
 
         func attempt(recreate: Bool) throws -> MemlocalSearchIndex {
-            if recreate { try removeLedgerDatabaseFiles() }
+            if recreate { try removeLedgerDatabaseFiles(at: databaseURL) }
             let writer = MemlocalSearchIndex(databaseURL: databaseURL)
             guard writer.isAvailable else {
                 let error = writer.initializationError ?? "unknown Rust database initialization error"
@@ -209,9 +217,10 @@ actor MemlocalMemoryStore: MemoryStore {
                 writer.close()
                 throw LedgerShadowError.memlocal(error)
             }
-            guard writer.exportLedger() == envelope else {
+            let written = writer.exportLedger()
+            guard envelope.matchesExport(written) else {
                 writer.close()
-                throw LedgerShadowError.mismatch("Rust export differed before reopen")
+                throw LedgerShadowError.mismatch("Rust export differed before reopen: \(mismatchSummary(expected: envelope, actual: written))")
             }
             writer.close()
 
@@ -221,7 +230,7 @@ actor MemlocalMemoryStore: MemoryStore {
                 reopened.close()
                 throw LedgerShadowError.memlocal(error)
             }
-            guard reopened.exportLedger() == envelope else {
+            guard envelope.matchesExport(reopened.exportLedger()) else {
                 let error = reopened.lastError ?? "Rust export differed after reopening the database"
                 reopened.close()
                 throw LedgerShadowError.mismatch(error)
@@ -244,8 +253,29 @@ actor MemlocalMemoryStore: MemoryStore {
             .appendingPathComponent("router-ledger.sqlite")
     }
 
-    private nonisolated static func removeLedgerDatabaseFiles() throws {
-        let databaseURL = ledgerDatabaseURL()
+    private nonisolated static func mismatchSummary(
+        expected: MemoryLedgerTransferEnvelope, actual: MemoryLedgerTransferEnvelope?
+    ) -> String {
+        let expectedByID = Dictionary(uniqueKeysWithValues: expected.records.map { ($0.id, $0) })
+        let actualByID = Dictionary(uniqueKeysWithValues: (actual?.records ?? []).map { ($0.id, $0) })
+        let differences = Set(expectedByID.keys).union(actualByID.keys).sorted().compactMap { id -> String? in
+            let wanted = expectedByID[id]
+            let found = actualByID[id]
+            guard wanted != found else { return nil }
+            let fields = [
+                "kind=\(wanted?.kind == found?.kind)",
+                "content=\(wanted?.content == found?.content)",
+                "createdAt=\(wanted?.createdAt.bitPattern == found?.createdAt.bitPattern) \(wanted?.createdAt ?? 0)->\(found?.createdAt ?? 0)",
+                "updatedAt=\(wanted?.updatedAt.bitPattern == found?.updatedAt.bitPattern) \(wanted?.updatedAt ?? 0)->\(found?.updatedAt ?? 0)",
+                "invalidatedAt=\(wanted?.invalidatedAt == found?.invalidatedAt)"
+            ].joined(separator: ",")
+            return "\(wanted?.kind.rawValue ?? found?.kind.rawValue ?? "missing"):\(id)" +
+                "(present=\(found != nil),payloadEqual=\(wanted?.payloadJSON == found?.payloadJSON),\(fields))"
+        }
+        return "expected=\(expected.records.count), actual=\(actual?.records.count ?? -1), differences=\(differences)"
+    }
+
+    private nonisolated static func removeLedgerDatabaseFiles(at databaseURL: URL) throws {
         let paths = [databaseURL.path, databaseURL.path + "-wal", databaseURL.path + "-shm"]
         for path in paths where FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(atPath: path)
