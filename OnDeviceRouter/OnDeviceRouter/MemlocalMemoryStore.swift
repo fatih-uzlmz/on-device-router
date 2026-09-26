@@ -44,7 +44,9 @@ actor MemlocalMemoryStore: MemoryStore {
         let resultLimit = max(1, min(limit, 8))
 
         for id in index.search(query: query, limit: max(resultLimit * 2, 8)) {
-            guard let fact = factsByID[id], selectedIDs.insert(fact.id).inserted else { continue }
+            guard let fact = factsByID[id],
+                  SimpleMemoryStore.matchesTopic(of: fact, query: query),
+                  selectedIDs.insert(fact.id).inserted else { continue }
             facts.append(fact)
             supplementalIDs.insert(fact.id)
             if facts.count >= resultLimit { break }
