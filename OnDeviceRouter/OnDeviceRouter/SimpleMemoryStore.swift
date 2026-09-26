@@ -151,6 +151,7 @@ actor SimpleMemoryStore: MemoryStore {
         purgeExpired(now: Date())
         let activeFacts = document.durableFacts.filter(\.isActive)
         let terms = Self.expandedQueryTerms(for: query)
+        let topicTerms = Self.queryTopicTerms(for: query)
         guard !terms.isEmpty, !activeFacts.isEmpty else {
             print("[Memory][Recall] no candidates (terms=\(terms.count), activeFacts=\(activeFacts.count))")
             return .empty
@@ -158,6 +159,10 @@ actor SimpleMemoryStore: MemoryStore {
 
         let queryEmbedding = embedding(for: query + " " + terms.joined(separator: " "))
         var ranked: [RankedFact] = activeFacts.compactMap { fact in
+            // Broad relation words such as "name" can otherwise make an
+            // unrelated memory look relevant to a domain-specific question.
+            guard Self.matchesTopic(of: fact, topicTerms: topicTerms) else { return nil }
+
             let lexical = bm25Score(documentText: fact.statement + " " + fact.sources.map(\.text).joined(separator: " "),
                                     queryTerms: terms,
                                     corpus: activeFacts)
@@ -380,12 +385,37 @@ actor SimpleMemoryStore: MemoryStore {
         "sister", "brother", "mother", "father", "mom", "dad", "wife", "husband", "partner"
     ]
     nonisolated private static let petKinds: Set<String> = ["dog", "cat", "bird", "rabbit", "pet"]
-    nonisolated private static let singleValuedPredicates: Set<String> = ["name", "lives_in"]
+    nonisolated private static let singleValuedPredicates: Set<String> = ["name", "lives_in", "value"]
+    nonisolated private static let genericMemoryQueryTerms: Set<String> = [
+        "name", "named", "fact", "facts", "memory", "memories", "remember", "saved", "stored",
+        "told", "asked", "know", "about"
+    ]
+    nonisolated private static let queryExpansions: [String: Set<String>] = [
+        "dog": ["pet", "owns", "name"], "pet": ["dog", "cat", "owns", "name"],
+        "name": ["named"], "dessert": ["cake", "chocolate", "likes", "prefers"],
+        "supermarket": ["food", "cake", "chocolate", "likes", "prefers"],
+        "family": ["sister", "brother", "mother", "father", "mom", "dad", "wife", "husband", "partner"],
+        "restaurant": ["place", "places", "prefers", "likes"],
+        "where": ["lives", "location"], "live": ["lives", "location"],
+    ]
 
     nonisolated private static func extractDurableFacts(from source: String) -> [ExtractedFact] {
         let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "’", with: "'")
         guard !text.isEmpty, !text.contains("?") else { return [] }
+
+        // An explicit "remember …" request is a durable assertion even when
+        // it does not fit one of the narrower personal-fact patterns below.
+        // Ignore any conversational lead-in before the word "remember".
+        if let remembered = captures(#"\bremember\s+(?:that\s+)?(.+)$"#, in: text)?.first {
+            let content = remembered.trimmingCharacters(in: .whitespacesAndNewlines)
+            let structuredFacts = extractDurableFacts(from: content)
+            if !structuredFacts.isEmpty { return structuredFacts }
+
+            if let assertion = captures(#"^(.+?)\s+(?:is|are|=)\s+(.+?)[.!]?$"#, in: content) {
+                return [rememberedAssertionFact(subject: assertion[0], value: assertion[1])]
+            }
+        }
 
         if let captures = captures(#"^my\s+([a-z][a-z -]*?)'s\s+name\s+is\s+(.+?)[.!]?$"#, in: text) {
             return [namedEntityFact(kind: captures[0], name: captures[1])]
@@ -430,6 +460,25 @@ actor SimpleMemoryStore: MemoryStore {
             )]
         }
         return []
+    }
+
+    nonisolated private static func rememberedAssertionFact(subject rawSubject: String, value rawValue: String) -> ExtractedFact {
+        let subjectText = cleanObject(rawSubject)
+            .replacingOccurrences(
+                of: #"^(?:the|a|an|my|our|your|this|that|thr)\s+"#,
+                with: "",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        let subjectTerms = keywords(in: subjectText)
+        let subject = subjectTerms.isEmpty ? "remembered_item" : subjectTerms.joined(separator: "_")
+        let value = cleanObject(rawValue)
+        let readableSubject = subjectTerms.isEmpty ? subjectText : subjectTerms.joined(separator: " ")
+        return ExtractedFact(
+            triple: MemoryTriple(subject: "user_\(subject)", predicate: "value", object: value),
+            statement: "Remembered: \(readableSubject) is \(value).",
+            importance: 0.93,
+            relationships: []
+        )
     }
 
     nonisolated private static func namedEntityFact(kind rawKind: String, name rawName: String) -> ExtractedFact {
@@ -501,18 +550,31 @@ actor SimpleMemoryStore: MemoryStore {
 
     nonisolated private static func expandedQueryTerms(for query: String) -> [String] {
         var terms = Set(keywords(in: query))
-        let expansions: [String: Set<String>] = [
-            "dog": ["pet", "owns", "name"], "pet": ["dog", "cat", "owns", "name"],
-            "name": ["named"], "dessert": ["cake", "chocolate", "likes", "prefers"],
-            "supermarket": ["food", "cake", "chocolate", "likes", "prefers"],
-            "family": ["sister", "brother", "mother", "father", "mom", "dad", "wife", "husband", "partner"],
-            "restaurant": ["place", "places", "prefers", "likes"],
-            "where": ["lives", "location"], "live": ["lives", "location"],
-        ]
         for term in Array(terms) {
-            terms.formUnion(expansions[term] ?? [])
+            terms.formUnion(queryExpansions[term] ?? [])
         }
         return Array(terms)
+    }
+
+    nonisolated private static func queryTopicTerms(for query: String) -> Set<String> {
+        let terms = Set(keywords(in: query))
+        var topics = terms.subtracting(genericMemoryQueryTerms)
+        for term in terms {
+            topics.formUnion((queryExpansions[term] ?? []).subtracting(genericMemoryQueryTerms))
+        }
+        return topics
+    }
+
+    nonisolated static func matchesTopic(of fact: DurableFact, query: String) -> Bool {
+        matchesTopic(of: fact, topicTerms: queryTopicTerms(for: query))
+    }
+
+    nonisolated private static func matchesTopic(of fact: DurableFact, topicTerms: Set<String>) -> Bool {
+        guard !topicTerms.isEmpty else { return true }
+        let factTerms = Set(keywords(in: fact.statement + " " + fact.triple.subject + " "
+            + fact.triple.predicate + " " + fact.triple.object + " "
+            + fact.sources.map(\.text).joined(separator: " ")))
+        return !topicTerms.isDisjoint(with: factTerms)
     }
 
     nonisolated private static func entityScore(_ triple: MemoryTriple, queryTerms: [String]) -> Double {

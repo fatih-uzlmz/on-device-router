@@ -94,6 +94,34 @@ struct OnDeviceRouterTests {
         #expect(snapshot.durableFacts.contains { $0.triple.object == "San Francisco" })
     }
 
+    @Test func explicitRememberPersistsAndRecallsTheMatchingProjectFact() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let firstStore = MemlocalMemoryStore(primary: SimpleMemoryStore(fileURL: url))
+        await firstStore.ingest(
+            userMessage: "My dog is named Snowball.",
+            assistantMessage: "Got it.",
+            route: "local"
+        )
+        await firstStore.ingest(
+            userMessage: "For this test, remember thr project code name is cedar -17.",
+            assistantMessage: "Cedar-17.",
+            route: "local"
+        )
+
+        let savedFacts = await firstStore.snapshot().durableFacts
+        #expect(savedFacts.count == 2)
+        #expect(savedFacts.contains { $0.statement == "Remembered: project code name is cedar -17." })
+
+        let restartedStore = MemlocalMemoryStore(primary: SimpleMemoryStore(fileURL: url))
+        let recall = await restartedStore.recall(matching: "What's the project name?", limit: 5)
+        #expect(recall.facts.count == 1)
+        #expect(recall.facts.first?.statement == "Remembered: project code name is cedar -17.")
+        #expect(recall.promptContext.contains("cedar -17"))
+        #expect(!recall.promptContext.contains("Snowball"))
+    }
+
     @Test func sisterPreferenceCreatesRelationshipAndSupportsDessertRecall() async throws {
         let url = temporaryMemoryURL()
         defer { try? FileManager.default.removeItem(at: url) }
