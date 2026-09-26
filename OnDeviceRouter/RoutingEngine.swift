@@ -48,6 +48,7 @@ final class RoutingEngine: ObservableObject {
 
     private let local: any LocalModelResponding
     private let memory: any MemoryStore
+    private var recentUserMessages: [String] = []
 
     init(
         local: any LocalModelResponding = LocalModelService(),
@@ -67,6 +68,11 @@ final class RoutingEngine: ObservableObject {
     func answer(_ query: String) async throws -> RoutedAnswer {
         let turnID = String(UUID().uuidString.prefix(8))
         print("[Debug][Turn \(turnID)] started in local-only mode")
+        let priorUserMessages = recentUserMessages
+        recentUserMessages.append(query)
+        if recentUserMessages.count > 8 {
+            recentUserMessages.removeFirst(recentUserMessages.count - 8)
+        }
 
         let recall = await memory.recall(matching: query, limit: 5)
         lastRecallHitCount = recall.facts.count
@@ -83,7 +89,11 @@ final class RoutingEngine: ObservableObject {
         let engine = self
         let text: String
         do {
-            text = try await local.respond(to: query, memoryContext: recall.promptContext) { status in
+            text = try await local.respond(
+                to: query,
+                memoryContext: recall.promptContext,
+                recentUserMessages: priorUserMessages
+            ) { status in
                 await engine.updateLocalModelStatus(status)
             }
         } catch {
@@ -97,9 +107,13 @@ final class RoutingEngine: ObservableObject {
         let entry = AuditEntry(query: query, decision: decision, latencyMs: latencyMs)
         auditLog.insert(entry, at: 0)
 
+        let activeFacts = await memory.snapshot().durableFacts
+        let extractedFacts = await local.extractMemories(from: query,
+                                                         existingFacts: activeFacts)
         await memory.ingest(userMessage: query,
                             assistantMessage: text,
-                            route: RouteDestination.local.rawValue)
+                            route: RouteDestination.local.rawValue,
+                            extractedFacts: extractedFacts)
         await refreshMemoryDiagnostics()
         print("[Debug][Turn \(turnID)] persisted: stored=\(memoryDiagnostics.storedCount), fileExists=\(memoryDiagnostics.fileExists), bytes=\(memoryDiagnostics.fileSizeBytes)")
         print("[Debug][Turn \(turnID)] finished")

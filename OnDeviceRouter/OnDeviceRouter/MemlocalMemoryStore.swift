@@ -1,15 +1,14 @@
 import Foundation
 import MemlocalCore
 
-/// Keeps the existing Swift ledger authoritative and uses MemLocal as an
-/// in-memory BM25 index for additional local retrieval candidates.
+/// Keeps Swift authoritative while maintaining a persistent, verified
+/// MemLocal shadow ledger and using its text index for supplemental recall.
 @available(iOS 26.0, *)
 actor MemlocalMemoryStore: MemoryStore {
     private let primary: SimpleMemoryStore
     private var index: MemlocalSearchIndex?
     private var didHydrateIndex = false
     private var hydrationTask: Task<MemorySnapshot, Never>?
-    private var indexedContentByID: [String: String] = [:]
     private var indexFailure: String?
 
     init(primary: SimpleMemoryStore = SimpleMemoryStore()) {
@@ -18,11 +17,17 @@ actor MemlocalMemoryStore: MemoryStore {
     }
 
     func ingest(userMessage: String, assistantMessage: String, route: String) async {
+        await ingest(userMessage: userMessage, assistantMessage: assistantMessage,
+                     route: route, extractedFacts: [])
+    }
+
+    func ingest(userMessage: String, assistantMessage: String, route: String,
+                extractedFacts: [MemoryCandidate]) async {
         await ensureIndexIsHydrated()
         await primary.ingest(userMessage: userMessage,
                              assistantMessage: assistantMessage,
-                             route: route)
-        synchronizeIndex(with: await primary.snapshot())
+                             route: route, extractedFacts: extractedFacts)
+        synchronizeLedger(with: await primary.snapshot())
     }
 
     func snapshot() async -> MemorySnapshot {
@@ -67,7 +72,8 @@ actor MemlocalMemoryStore: MemoryStore {
         return MemoryRecall(
             facts: facts,
             episodes: swiftRecall.episodes,
-            relationships: relationshipsByID.values.sorted { $0.createdAt > $1.createdAt }
+            relationships: relationshipsByID.values.sorted { $0.createdAt > $1.createdAt },
+            conversationEvidence: swiftRecall.conversationEvidence
         )
     }
 
@@ -83,7 +89,17 @@ actor MemlocalMemoryStore: MemoryStore {
     func clear() async {
         await ensureIndexIsHydrated()
         await primary.clear()
-        synchronizeIndex(with: await primary.snapshot())
+        index?.close()
+        index = nil
+        do {
+            try Self.removeLedgerDatabaseFiles()
+            indexFailure = nil
+            didHydrateIndex = false
+            hydrationTask = nil
+            await ensureIndexIsHydrated()
+        } catch {
+            disableIndex("could not remove cleared shadow ledger: \(error.localizedDescription)")
+        }
     }
 
     private var isIndexAvailable: Bool {
@@ -92,53 +108,116 @@ actor MemlocalMemoryStore: MemoryStore {
 
     private func ensureIndexIsHydrated() async {
         guard !didHydrateIndex else { return }
-        if index == nil {
-            let index = MemlocalSearchIndex()
-            self.index = index
-            if let error = index.initializationError {
-                indexFailure = error
-                didHydrateIndex = true
-                print("[Memory][Memlocal] unavailable; using Swift retrieval: \(error)")
-                return
-            }
-        }
-        guard isIndexAvailable else {
-            didHydrateIndex = true
-            return
-        }
         if hydrationTask == nil {
             hydrationTask = Task { await primary.snapshot() }
         }
         guard let hydrationTask else { return }
         let snapshot = await hydrationTask.value
         guard !didHydrateIndex else { return }
-        synchronizeIndex(with: snapshot)
-        didHydrateIndex = true
         self.hydrationTask = nil
-        print("[Memory][Memlocal] text index ready; indexed=\(indexedContentByID.count)")
+
+        do {
+            let envelope = try MemoryLedgerTransferEnvelope(snapshot: snapshot)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(envelope)
+            guard let json = String(data: data, encoding: .utf8) else {
+                throw LedgerShadowError.invalidUTF8
+            }
+            let verified = try Self.openVerifiedLedger(envelope: envelope, json: json)
+            index = verified
+            indexFailure = nil
+            print("[Memory][Memlocal] persistent ledger ready; records=\(envelope.records.count)")
+        } catch {
+            disableIndex(error.localizedDescription)
+        }
+        didHydrateIndex = true
     }
 
-    private func synchronizeIndex(with snapshot: MemorySnapshot) {
+    private func synchronizeLedger(with snapshot: MemorySnapshot) {
         guard isIndexAvailable, let index else { return }
-        let activeFacts = Dictionary(uniqueKeysWithValues: snapshot.durableFacts.map {
-            ($0.id.uuidString, $0)
-        })
-        let activeIDs = Set(activeFacts.keys)
-
-        for staleID in Array(indexedContentByID.keys) where !activeIDs.contains(staleID) {
-            guard index.delete(id: staleID) else {
-                disableIndex(index.lastError ?? "delete failed")
+        do {
+            let envelope = try MemoryLedgerTransferEnvelope(snapshot: snapshot)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(envelope)
+            guard let json = String(data: data, encoding: .utf8) else {
+                throw LedgerShadowError.invalidUTF8
+            }
+            guard index.syncLedger(json) else {
+                disableIndex(index.lastError ?? "ledger synchronization failed")
                 return
             }
-            indexedContentByID.removeValue(forKey: staleID)
+            guard index.exportLedger() == envelope else {
+                disableIndex("Rust ledger snapshot did not match Swift after synchronization")
+                return
+            }
+        } catch {
+            disableIndex(error.localizedDescription)
+        }
+    }
+
+    private nonisolated static func openVerifiedLedger(
+        envelope: MemoryLedgerTransferEnvelope,
+        json: String
+    ) throws -> MemlocalSearchIndex {
+        let databaseURL = ledgerDatabaseURL()
+        let parent = databaseURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+
+        func attempt(recreate: Bool) throws -> MemlocalSearchIndex {
+            if recreate { try removeLedgerDatabaseFiles() }
+            let writer = MemlocalSearchIndex(databaseURL: databaseURL)
+            guard writer.isAvailable else {
+                let error = writer.initializationError ?? "unknown Rust database initialization error"
+                writer.close()
+                throw LedgerShadowError.memlocal(error)
+            }
+            guard writer.syncLedger(json) else {
+                let error = writer.lastError ?? "Rust ledger synchronization failed"
+                writer.close()
+                throw LedgerShadowError.memlocal(error)
+            }
+            guard writer.exportLedger() == envelope else {
+                writer.close()
+                throw LedgerShadowError.mismatch("Rust export differed before reopen")
+            }
+            writer.close()
+
+            let reopened = MemlocalSearchIndex(databaseURL: databaseURL)
+            guard reopened.isAvailable else {
+                let error = reopened.initializationError ?? "unknown Rust database reopen error"
+                reopened.close()
+                throw LedgerShadowError.memlocal(error)
+            }
+            guard reopened.exportLedger() == envelope else {
+                let error = reopened.lastError ?? "Rust export differed after reopening the database"
+                reopened.close()
+                throw LedgerShadowError.mismatch(error)
+            }
+            return reopened
         }
 
-        for (id, fact) in activeFacts where indexedContentByID[id] != fact.statement {
-            guard index.put(id: id, content: fact.statement) else {
-                disableIndex(index.lastError ?? "put failed")
-                return
-            }
-            indexedContentByID[id] = fact.statement
+        do {
+            return try attempt(recreate: false)
+        } catch {
+            // The Swift JSON ledger remains canonical. A failed Rust shadow is
+            // disposable, so rebuild it from the complete current snapshot.
+            return try attempt(recreate: true)
+        }
+    }
+
+    private nonisolated static func ledgerDatabaseURL() -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MemLocal", isDirectory: true)
+            .appendingPathComponent("router-ledger.sqlite")
+    }
+
+    private nonisolated static func removeLedgerDatabaseFiles() throws {
+        let databaseURL = ledgerDatabaseURL()
+        let paths = [databaseURL.path, databaseURL.path + "-wal", databaseURL.path + "-shm"]
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.removeItem(atPath: path)
         }
     }
 
@@ -146,42 +225,83 @@ actor MemlocalMemoryStore: MemoryStore {
         indexFailure = error
         index?.close()
         index = nil
-        indexedContentByID.removeAll()
         print("[Memory][Memlocal] disabled; using Swift retrieval: \(error)")
+    }
+}
+
+private enum LedgerShadowError: LocalizedError {
+    case invalidUTF8
+    case memlocal(String)
+    case mismatch(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidUTF8:
+            return "Ledger JSON could not be encoded as UTF-8"
+        case .memlocal(let message):
+            return "MemLocal shadow ledger failed: \(message)"
+        case .mismatch(let message):
+            return "MemLocal ledger verification failed: \(message)"
+        }
     }
 }
 
 /// Synchronous, actor-confined owner of the C ABI handle.
 nonisolated private final class MemlocalSearchIndex {
-    private let config = #"{"storage":{"in_memory":true}}"#
+    private let config: String
     private var handle: UnsafeMutableRawPointer?
     private(set) var initializationError: String?
     private(set) var lastError: String?
 
     var isAvailable: Bool { handle != nil }
 
-    init() {
+    init(databaseURL: URL) {
+        do {
+            try FileManager.default.createDirectory(
+                at: databaseURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let configObject: [String: Any] = [
+                "storage": [
+                    "in_memory": false,
+                    "db_path": databaseURL.path,
+                    "embedding_dimensions": RouterEmbeddingIndex.dimension
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: configObject, options: [.sortedKeys])
+            guard let config = String(data: data, encoding: .utf8) else {
+                throw LedgerShadowError.invalidUTF8
+            }
+            self.config = config
+        } catch {
+            self.config = "{}"
+            initializationError = error.localizedDescription
+            return
+        }
         handle = config.withCString { memlocal_open($0) }
         if handle == nil {
             initializationError = currentError()
         }
     }
 
-    func put(id: String, content: String) -> Bool {
+    func syncLedger(_ json: String) -> Bool {
         guard let handle else { return false }
-        let status = config.withCString { configPointer in
-            id.withCString { idPointer in
-                content.withCString { contentPointer in
-                    memlocal_put_memory_with_id(handle, configPointer, idPointer, contentPointer)
-                }
-            }
-        }
-        return record(status)
+        return record(json.withCString { memlocal_sync_router_ledger(handle, $0) })
     }
 
-    func delete(id: String) -> Bool {
-        guard let handle else { return false }
-        return record(id.withCString { memlocal_delete_memory(handle, $0) })
+    func exportLedger() -> MemoryLedgerTransferEnvelope? {
+        guard let handle else { return nil }
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        let status = memlocal_export_router_ledger(handle, &jsonPointer)
+        guard record(status), let jsonPointer else { return nil }
+        defer { memlocal_free_string(jsonPointer) }
+
+        guard let data = String(cString: jsonPointer).data(using: .utf8),
+              let envelope = try? JSONDecoder().decode(MemoryLedgerTransferEnvelope.self, from: data) else {
+            lastError = "MemLocal returned invalid ledger JSON"
+            return nil
+        }
+        return envelope
     }
 
     func search(query: String, limit: Int) -> [String] {
@@ -197,6 +317,34 @@ nonisolated private final class MemlocalSearchIndex {
         guard let data = String(cString: jsonPointer).data(using: .utf8),
               let results = try? JSONDecoder().decode([SearchResult].self, from: data) else {
             lastError = "MemLocal returned invalid search JSON"
+            return []
+        }
+        return results.map(\.id)
+    }
+
+    func searchHybrid(query: String, embedding: [Double], limit: Int) -> [String] {
+        guard let handle else { return [] }
+        guard let data = try? JSONEncoder().encode(embedding),
+              let embeddingJSON = String(data: data, encoding: .utf8) else {
+            lastError = "Could not encode the on-device query embedding"
+            return []
+        }
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        let status = query.withCString { queryPointer in
+            embeddingJSON.withCString { embeddingPointer in
+                memlocal_search_router_hybrid(
+                    handle, queryPointer, embeddingPointer,
+                    UInt32(clamping: limit), &jsonPointer
+                )
+            }
+        }
+        guard record(status), let jsonPointer else { return [] }
+        defer { memlocal_free_string(jsonPointer) }
+
+        struct SearchResult: Decodable { let id: String }
+        guard let data = String(cString: jsonPointer).data(using: .utf8),
+              let results = try? JSONDecoder().decode([SearchResult].self, from: data) else {
+            lastError = "MemLocal returned invalid hybrid search JSON"
             return []
         }
         return results.map(\.id)
@@ -228,4 +376,8 @@ nonisolated private final class MemlocalSearchIndex {
         memlocal_free_error(pointer)
         return error
     }
+}
+
+nonisolated private enum RouterEmbeddingIndex {
+    static let dimension = 128
 }

@@ -5,20 +5,31 @@ import Testing
 private actor LocalModelSpy: LocalModelResponding {
     private(set) var prompts: [String] = []
     private(set) var contexts: [String] = []
+    private(set) var histories: [[String]] = []
+    private var extractionResults: [String: [MemoryCandidate]] = [:]
 
     func respond(
         to prompt: String,
         memoryContext: String,
+        recentUserMessages: [String],
         status: @escaping LocalModelService.StatusHandler
     ) async throws -> String {
         prompts.append(prompt)
         contexts.append(memoryContext)
+        histories.append(recentUserMessages)
         await status(.ready)
         return "Local response"
     }
 
     func callCount() -> Int { prompts.count }
     func lastContext() -> String { contexts.last ?? "" }
+    func lastHistory() -> [String] { histories.last ?? [] }
+    func setExtraction(_ facts: [MemoryCandidate], for message: String) {
+        extractionResults[message] = facts
+    }
+    func extractMemories(from message: String, existingFacts: [DurableFact]) async -> [MemoryCandidate] {
+        extractionResults[message] ?? []
+    }
 }
 
 private struct LegacyMemoryFixture: Codable {
@@ -194,6 +205,155 @@ struct OnDeviceRouterTests {
         #expect(recall.facts.count == 1)
         #expect(recall.facts.first?.triple.object == "Max")
         #expect(!recall.facts.contains { $0.triple.object == "Snow" })
+    }
+
+    @Test func favoriteCorrectionReplacesDurableFactBeforeNextAnswer() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let firstChat = SimpleMemoryStore(fileURL: url)
+        await firstChat.ingest(
+            userMessage: "My favorite programming language is python",
+            assistantMessage: "Got it.", route: "local"
+        )
+        #expect(await firstChat.snapshot().durableFacts.first?.triple.object == "python")
+
+        let secondChat = MemlocalMemoryStore(primary: SimpleMemoryStore(fileURL: url))
+        let local = LocalModelSpy()
+        let engine = RoutingEngine(local: local, memory: secondChat)
+        _ = try await engine.answer("my fav programming language is rust")
+        _ = try await engine.answer("whats my favorite programming language")
+
+        let snapshot = await secondChat.snapshot()
+        #expect(snapshot.durableFacts.map(\.triple.object) == ["rust"])
+        #expect(snapshot.invalidatedFacts.map(\.triple.object) == ["python"])
+        let context = await local.lastContext()
+        #expect(context.contains("favorite programming language is rust"))
+        #expect(!context.contains("python"))
+        #expect(await local.lastHistory() == ["my fav programming language is rust"])
+    }
+
+    @Test func recentChatStatementIsPassedEvenWhenExtractorDoesNotRecognizeIt() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        await store.ingest(userMessage: "My favorite programming language is python",
+                           assistantMessage: "OK", route: "local")
+        let local = LocalModelSpy()
+        let engine = RoutingEngine(local: local, memory: store)
+
+        _ = try await engine.answer("Actually, Rust is my favorite programming language now.")
+        _ = try await engine.answer("What's my favorite programming language?")
+
+        #expect(await store.snapshot().durableFacts.first?.triple.object == "python")
+        #expect(await local.lastHistory() == ["Actually, Rust is my favorite programming language now."])
+        let prompt = LocalModelService.structuredPrompt(
+            "What's my favorite programming language?",
+            memoryContext: await local.lastContext(),
+            recentUserMessages: await local.lastHistory()
+        )
+        let oldFactPosition = prompt.range(of: "python")?.lowerBound
+        let newStatementPosition = prompt.range(of: "Rust")?.lowerBound
+        #expect(oldFactPosition != nil && newStatementPosition != nil)
+        if let oldFactPosition, let newStatementPosition {
+            #expect(newStatementPosition < oldFactPosition)
+        }
+        #expect(prompt.contains("Recent user statements"))
+    }
+
+    @Test func modelExtractedCorrectionPersistsAcrossRestart() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let original = SimpleMemoryStore(fileURL: url)
+        await original.ingest(userMessage: "My favorite programming language is Python",
+                              assistantMessage: "OK", route: "local")
+        let oldFact = try #require(await original.snapshot().durableFacts.first)
+        let correction = "I changed my mind. My new favorite language is Rust"
+        let candidate = MemoryCandidate(
+            subject: "user", predicate: "favorite_language", object: "Rust",
+            evidence: "My new favorite language is Rust", replacesFactID: oldFact.id
+        )
+        let local = LocalModelSpy()
+        await local.setExtraction([candidate], for: correction)
+        let engine = RoutingEngine(local: local, memory: original)
+        _ = try await engine.answer(correction)
+
+        let restarted = SimpleMemoryStore(fileURL: url)
+        let snapshot = await restarted.snapshot()
+        let recall = await restarted.recall(matching: "What's my favorite programming language?",
+                                            limit: 5)
+        #expect(snapshot.durableFacts.map(\.triple.object) == ["Rust"])
+        #expect(snapshot.invalidatedFacts.map(\.triple.object) == ["Python"])
+        #expect(recall.facts.map(\.triple.object) == ["Rust"])
+        #expect(!recall.promptContext.contains("Python"))
+    }
+
+    @Test func extractedFactsRequireVerbatimUserEvidence() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        let invented = MemoryCandidate(subject: "user", predicate: "favorite_language",
+                                       object: "Rust", evidence: "My favorite language is Rust",
+                                       replacesFactID: nil)
+        await store.ingest(userMessage: "I like Python",
+                           assistantMessage: "OK", route: "local",
+                           extractedFacts: [invented])
+        let snapshot = await store.snapshot()
+        #expect(!snapshot.durableFacts.contains { $0.triple.object == "Rust" })
+    }
+
+    @Test func modelCorrectionLinkSurvivesPatternExtraction() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        await store.ingest(userMessage: "My favorite programming language is Python",
+                           assistantMessage: "OK", route: "local")
+        let old = try #require(await store.snapshot().durableFacts.first)
+        let message = "My favorite language is Rust"
+        let candidate = MemoryCandidate(subject: "user", predicate: "favorite_language",
+                                        object: "Rust", evidence: message,
+                                        replacesFactID: old.id)
+        await store.ingest(userMessage: message, assistantMessage: "OK", route: "local",
+                           extractedFacts: [candidate])
+        let snapshot = await store.snapshot()
+        #expect(snapshot.durableFacts.map(\.triple.object) == ["Rust"])
+        #expect(snapshot.invalidatedFacts.map(\.triple.object) == ["Python"])
+    }
+
+    @Test func modelCannotTurnAQuestionIntoADurableFact() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        let message = "Is my favorite language Rust?"
+        let candidate = MemoryCandidate(subject: "user", predicate: "favorite_language",
+                                        object: "Rust", evidence: message,
+                                        replacesFactID: nil)
+        await store.ingest(userMessage: message, assistantMessage: "I don't know.",
+                           route: "local", extractedFacts: [candidate])
+        #expect(await store.snapshot().durableFacts.isEmpty)
+    }
+
+    @Test func onDeviceModelExtractsNaturalLanguageCorrection() async throws {
+        let url = temporaryMemoryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = SimpleMemoryStore(fileURL: url)
+        await store.ingest(userMessage: "My favorite programming language is Python",
+                           assistantMessage: "OK", route: "local")
+        let oldFact = try #require(await store.snapshot().durableFacts.first)
+        let correction = "I changed my mind. My new favorite language is Rust"
+        let candidates = await LocalModelService().extractMemories(
+            from: correction, existingFacts: [oldFact]
+        )
+        #expect(candidates.contains { $0.object == "Rust" })
+    }
+
+    @Test func onDeviceModelExtractsMultipleAtomicFacts() async {
+        let message = "My dog is named Snow. I live in San Francisco."
+        let candidates = await LocalModelService().extractMemories(
+            from: message, existingFacts: []
+        )
+        #expect(candidates.contains { $0.object == "Snow" })
+        #expect(candidates.contains { $0.object == "San Francisco" })
     }
 
     @Test func unrelatedFactsDoNotContaminateRecall() async throws {

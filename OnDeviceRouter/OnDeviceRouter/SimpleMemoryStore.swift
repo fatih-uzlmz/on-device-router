@@ -96,6 +96,12 @@ actor SimpleMemoryStore: MemoryStore {
     }
 
     func ingest(userMessage: String, assistantMessage: String, route: String) async {
+        await ingest(userMessage: userMessage, assistantMessage: assistantMessage,
+                     route: route, extractedFacts: [])
+    }
+
+    func ingest(userMessage: String, assistantMessage: String, route: String,
+                extractedFacts: [MemoryCandidate]) async {
         let now = Date()
         purgeExpired(now: now)
 
@@ -108,16 +114,47 @@ actor SimpleMemoryStore: MemoryStore {
             expiresAt: now.addingTimeInterval(Self.transientLifetime)
         ))
 
-        let facts = Self.extractDurableFacts(from: userMessage)
+        let activeFacts = document.durableFacts.filter(\.isActive)
+        let modelFacts = extractedFacts.compactMap { candidate -> (ExtractedFact, UUID?)? in
+            guard let valid = MemoryExtraction.validated(candidate, source: userMessage,
+                                                         existingFacts: activeFacts) else { return nil }
+            let replaced = valid.replacesFactID.flatMap { id in activeFacts.first { $0.id == id } }
+            let triple = MemoryTriple(subject: replaced?.triple.subject ?? valid.subject,
+                                      predicate: replaced?.triple.predicate ?? valid.predicate,
+                                      object: valid.object)
+            let statement = replaced.map {
+                $0.statement.replacingOccurrences(of: $0.triple.object, with: valid.object)
+            } ?? Self.statement(for: triple)
+            return (ExtractedFact(triple: triple, statement: statement,
+                                  importance: 0.9, relationships: []), replaced?.id)
+        }
+        let deterministicFacts = MemoryExtraction.sentences(in: userMessage)
+            .flatMap { Self.extractDurableFacts(from: $0) }
+        let facts = deterministicFacts.map { deterministic -> (ExtractedFact, UUID?) in
+            // Keep the model's correction link even when a pattern also found
+            // the new value. Otherwise a wording change can leave both active.
+            if let model = modelFacts.first(where: {
+                Self.normalized($0.0.triple.object) == Self.normalized(deterministic.triple.object)
+                    && $0.1 != nil
+            }) {
+                return model
+            }
+            return (deterministic, nil)
+        } + modelFacts.filter { modelFact in
+            !deterministicFacts.contains {
+                Self.normalized($0.triple.object) == Self.normalized(modelFact.0.triple.object)
+            }
+        }
         let episodes = Self.extractEpisodes(from: userMessage, now: now)
         if facts.isEmpty {
             print("[Memory][Extract] skipped durable storage: no personal fact in ‘\(Self.logSnippet(userMessage))’")
         } else {
-            print("[Memory][Extract] \(facts.count) durable fact(s): \(facts.map(\.statement).joined(separator: " | "))")
+            print("[Memory][Extract] \(facts.count) durable fact(s): \(facts.map { $0.0.statement }.joined(separator: " | "))")
         }
 
-        for extracted in facts {
-            upsert(extracted, sourceText: userMessage, timestamp: now)
+        for (extracted, replacedID) in facts {
+            upsert(extracted, sourceText: userMessage, timestamp: now,
+                   replacesFactID: replacedID)
         }
         for episode in episodes {
             document.episodes.removeAll { $0.kind == episode.kind }
@@ -152,9 +189,16 @@ actor SimpleMemoryStore: MemoryStore {
         let activeFacts = document.durableFacts.filter(\.isActive)
         let terms = Self.expandedQueryTerms(for: query)
         let topicTerms = Self.queryTopicTerms(for: query)
+        let evidence = document.conversationTurns
+            .sorted { $0.timestamp > $1.timestamp }
+            .first { turn in
+                !Set(Self.keywords(in: turn.userMessage)).isDisjoint(with: topicTerms)
+                    && !turn.userMessage.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+            }.map { [$0] } ?? []
         guard !terms.isEmpty, !activeFacts.isEmpty else {
             print("[Memory][Recall] no candidates (terms=\(terms.count), activeFacts=\(activeFacts.count))")
-            return .empty
+            return MemoryRecall(facts: [], episodes: [], relationships: [],
+                                conversationEvidence: evidence)
         }
 
         let queryEmbedding = embedding(for: query + " " + terms.joined(separator: " "))
@@ -229,7 +273,8 @@ actor SimpleMemoryStore: MemoryStore {
         if !selected.isEmpty { persist() }
         return MemoryRecall(facts: selected,
                             episodes: Array(relevantEpisodes),
-                            relationships: relevantRelationships)
+                            relationships: relevantRelationships,
+                            conversationEvidence: evidence)
     }
 
     func count() async -> Int {
@@ -287,7 +332,8 @@ actor SimpleMemoryStore: MemoryStore {
 
     // MARK: - Fact lifecycle
 
-    private func upsert(_ extracted: ExtractedFact, sourceText: String, timestamp: Date) {
+    private func upsert(_ extracted: ExtractedFact, sourceText: String, timestamp: Date,
+                        replacesFactID: UUID? = nil) {
         let key = Self.factKey(extracted.triple)
         let object = Self.normalized(extracted.triple.object)
         if let index = document.durableFacts.firstIndex(where: {
@@ -305,9 +351,11 @@ actor SimpleMemoryStore: MemoryStore {
             return
         }
 
-        if Self.singleValuedPredicates.contains(Self.normalized(extracted.triple.predicate)) {
+        if Self.singleValuedPredicates.contains(Self.normalized(extracted.triple.predicate))
+            || replacesFactID != nil {
             for index in document.durableFacts.indices where document.durableFacts[index].isActive
-                && Self.factKey(document.durableFacts[index].triple) == key
+                && (Self.factKey(document.durableFacts[index].triple) == key
+                    || document.durableFacts[index].id == replacesFactID)
                 && Self.normalized(document.durableFacts[index].triple.object) != object {
                 document.durableFacts[index].invalidatedAt = timestamp
                 document.durableFacts[index].confidence *= 0.5
@@ -429,6 +477,16 @@ actor SimpleMemoryStore: MemoryStore {
         if let captures = captures(#"^my\s+(sister|brother|mother|father|mom|dad|wife|husband|partner)\s+is\s+(.+?)[.!]?$"#, in: text) {
             return [namedEntityFact(kind: captures[0], name: captures[1])]
         }
+        if let captures = captures(#"^my\s+(?:favorite|favourite|fav)\s+([a-z][a-z0-9 -]*?)\s+is\s+(.+?)[.!]?$"#, in: text) {
+            let kind = normalized(captures[0]).replacingOccurrences(of: " ", with: "_")
+            let value = cleanObject(captures[1])
+            return [ExtractedFact(
+                triple: MemoryTriple(subject: "user_favorite_\(kind)", predicate: "value", object: value),
+                statement: "User's favorite \(captures[0].lowercased()) is \(value).",
+                importance: 0.9,
+                relationships: []
+            )]
+        }
         if let captures = captures(#"^my\s+([a-z][a-z -]*?)\s+(loves|likes|prefers|hates)\s+(.+?)[.!]?$"#, in: text) {
             let kind = normalized(captures[0]).replacingOccurrences(of: " ", with: "_")
             let verb = canonicalPreferenceVerb(captures[1])
@@ -502,6 +560,12 @@ actor SimpleMemoryStore: MemoryStore {
             importance: 0.95,
             relationships: relationships
         )
+    }
+
+    nonisolated private static func statement(for triple: MemoryTriple) -> String {
+        let subject = triple.subject.replacingOccurrences(of: "_", with: " ")
+        let predicate = triple.predicate.replacingOccurrences(of: "_", with: " ")
+        return "\(subject.capitalized) \(predicate) \(triple.object)."
     }
 
     nonisolated private static func extractEpisodes(from source: String, now: Date) -> [EpisodicMemory] {

@@ -35,6 +35,22 @@ fn read_c_string(pointer: *const c_char) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+fn read_embedding(pointer: *const c_char, expected_dimensions: usize) -> Result<Vec<f32>, String> {
+    let json = read_c_string(pointer)?;
+    let embedding: Vec<f32> =
+        serde_json::from_str(&json).map_err(|error| format!("invalid embedding JSON: {error}"))?;
+    if embedding.len() != expected_dimensions {
+        return Err(format!(
+            "embedding dimension mismatch: expected {expected_dimensions}, received {}",
+            embedding.len()
+        ));
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Err("embedding values must be finite".to_owned());
+    }
+    Ok(embedding)
+}
+
 fn status_code(operation: impl FnOnce() -> Result<(), String>) -> c_int {
     clear_error();
 
@@ -57,8 +73,7 @@ pub extern "C" fn memlocal_open(config_json: *const c_char) -> *mut c_void {
 
     let opened = catch_unwind(AssertUnwindSafe(|| -> Result<*mut c_void, String> {
         let json = read_c_string(config_json)?;
-        let config: CoreConfig =
-            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        let config: CoreConfig = serde_json::from_str(&json).map_err(|error| error.to_string())?;
         let engine = MemlocalEngine::open(config).map_err(|error| error.to_string())?;
         Ok(Box::into_raw(Box::new(engine)).cast())
     }));
@@ -93,6 +108,7 @@ pub extern "C" fn memlocal_put_memory(
     handle: *mut c_void,
     config_json: *const c_char,
     content: *const c_char,
+    embedding_json: *const c_char,
 ) -> c_int {
     status_code(|| {
         if handle.is_null() {
@@ -100,13 +116,12 @@ pub extern "C" fn memlocal_put_memory(
         }
 
         let json = read_c_string(config_json)?;
-        let config: CoreConfig =
-            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        let config: CoreConfig = serde_json::from_str(&json).map_err(|error| error.to_string())?;
         let dimensions = usize::try_from(config.storage.embedding_dimensions)
             .map_err(|error| error.to_string())?;
         let content = read_c_string(content)?;
+        let embedding = read_embedding(embedding_json, dimensions)?;
         let item = MemoryItem::new(content, MemoryType::Factual);
-        let embedding = vec![0.0_f32; dimensions];
         let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
 
         engine
@@ -121,6 +136,7 @@ pub extern "C" fn memlocal_put_memory_with_id(
     config_json: *const c_char,
     id: *const c_char,
     content: *const c_char,
+    embedding_json: *const c_char,
 ) -> c_int {
     status_code(|| {
         if handle.is_null() {
@@ -128,15 +144,14 @@ pub extern "C" fn memlocal_put_memory_with_id(
         }
 
         let json = read_c_string(config_json)?;
-        let config: CoreConfig =
-            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        let config: CoreConfig = serde_json::from_str(&json).map_err(|error| error.to_string())?;
         let dimensions = usize::try_from(config.storage.embedding_dimensions)
             .map_err(|error| error.to_string())?;
         let id = read_c_string(id)?;
         let content = read_c_string(content)?;
+        let embedding = read_embedding(embedding_json, dimensions)?;
         let mut item = MemoryItem::new(content, MemoryType::Factual);
         item.id = id;
-        let embedding = vec![0.0_f32; dimensions];
         let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
 
         engine
@@ -146,10 +161,7 @@ pub extern "C" fn memlocal_put_memory_with_id(
 }
 
 #[no_mangle]
-pub extern "C" fn memlocal_delete_memory(
-    handle: *mut c_void,
-    id: *const c_char,
-) -> c_int {
+pub extern "C" fn memlocal_delete_memory(handle: *mut c_void, id: *const c_char) -> c_int {
     status_code(|| {
         if handle.is_null() {
             return Err("null engine handle".to_owned());
@@ -172,7 +184,9 @@ pub extern "C" fn memlocal_search_text(
         if out_json.is_null() {
             return Err("null out pointer".to_owned());
         }
-        unsafe { *out_json = ptr::null_mut(); }
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
 
         if handle.is_null() {
             return Err("null engine handle".to_owned());
@@ -181,12 +195,118 @@ pub extern "C" fn memlocal_search_text(
         let query = read_c_string(query)?;
         let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
         let items = engine
-            .search_text(&query, k as usize)
+            .search_router_facts_text(&query, k as usize)
             .map_err(|error| error.to_string())?;
         let json = serde_json::to_string(&items).map_err(|error| error.to_string())?;
         let result = CString::new(json).map_err(|error| error.to_string())?;
 
-        unsafe { *out_json = result.into_raw(); }
+        unsafe {
+            *out_json = result.into_raw();
+        }
+        Ok(())
+    })
+}
+
+/// Hybrid search using an app-generated on-device embedding vector.
+#[no_mangle]
+pub extern "C" fn memlocal_search_router_hybrid(
+    handle: *mut c_void,
+    query: *const c_char,
+    embedding_json: *const c_char,
+    k: u32,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    status_code(|| {
+        if out_json.is_null() {
+            return Err("null out pointer".to_owned());
+        }
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+        let query = read_c_string(query)?;
+        let embedding_json = read_c_string(embedding_json)?;
+        let embedding: Vec<f64> = serde_json::from_str(&embedding_json)
+            .map_err(|error| format!("invalid query embedding JSON: {error}"))?;
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        let items = engine
+            .search_router_facts_hybrid(&query, &embedding, k as usize)
+            .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(&items).map_err(|error| error.to_string())?;
+        let result = CString::new(json).map_err(|error| error.to_string())?;
+        unsafe {
+            *out_json = result.into_raw();
+        }
+        Ok(())
+    })
+}
+
+/// Reconcile the persistent shadow ledger with the latest Swift snapshot.
+#[no_mangle]
+pub extern "C" fn memlocal_sync_router_ledger(
+    handle: *mut c_void,
+    ledger_json: *const c_char,
+) -> c_int {
+    status_code(|| {
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+        let json = read_c_string(ledger_json)?;
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        engine
+            .sync_router_ledger(&json)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Import an entire versioned app-ledger snapshot into an empty shadow DB.
+#[no_mangle]
+pub extern "C" fn memlocal_import_router_ledger(
+    handle: *mut c_void,
+    ledger_json: *const c_char,
+) -> c_int {
+    status_code(|| {
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+        let json = read_c_string(ledger_json)?;
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        engine
+            .import_router_ledger(&json)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Export the imported app-ledger snapshot for verification after reopen.
+#[no_mangle]
+pub extern "C" fn memlocal_export_router_ledger(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    status_code(|| {
+        if out_json.is_null() {
+            return Err("null out pointer".to_owned());
+        }
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        let envelope = engine
+            .export_router_ledger()
+            .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+        let result = CString::new(json).map_err(|error| error.to_string())?;
+        unsafe {
+            *out_json = result.into_raw();
+        }
         Ok(())
     })
 }
