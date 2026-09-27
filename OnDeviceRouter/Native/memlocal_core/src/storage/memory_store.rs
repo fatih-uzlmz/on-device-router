@@ -26,6 +26,16 @@ impl MemoryStore {
                 .map_err(|e| MemlocalError::Database(format!("Failed to open in-memory DB: {e}")))?
         } else {
             let path = config.db_path.as_deref().unwrap_or("memlocal.db");
+            // Belt-and-braces: ensure the parent directory exists even if a caller
+            // bypasses the Swift-side directory creation. Missing parents surface
+            // as SQLITE_CANTOPEN (code 14) on iOS.
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        MemlocalError::Database(format!("Failed to create ledger DB parent dir: {e}"))
+                    })?;
+                }
+            }
             debug!("[MemoryStore] Opening SQLite database at: {path}");
             DbInstance::new("sqlite", path, "")
                 .map_err(|e| MemlocalError::Database(format!("Failed to open SQLite DB: {e}")))?

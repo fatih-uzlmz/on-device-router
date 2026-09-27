@@ -525,10 +525,19 @@ nonisolated private final class MemlocalSearchIndex {
                 at: databaseURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            let dbPath = databaseURL.path
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: dbPath, isDirectory: &isDir), isDir.boolValue {
+                // A stale directory at the DB file path makes SQLite fail with
+                // SQLITE_CANTOPEN (code 14). Remove it so the DB file can be created.
+                print("[Memory][Memlocal] removing stale directory at ledger DB path: \(dbPath)")
+                try FileManager.default.removeItem(atPath: dbPath)
+            }
+            print("[Memory][Memlocal] opening ledger DB at: \(dbPath)")
             let configObject: [String: Any] = [
                 "storage": [
                     "in_memory": false,
-                    "db_path": databaseURL.path,
+                    "db_path": dbPath,
                     "embedding_dimensions": RouterEmbeddingIndex.dimension
                 ]
             ]
