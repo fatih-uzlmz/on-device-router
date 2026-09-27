@@ -70,6 +70,10 @@ impl MemoryStore {
         ));
         self.try_run(&MemorySchema::create_fts_index());
         self.try_run(&MemorySchema::create_lsh_index());
+        // One-time repair: drop the legacy triples FTS index (broken extractor
+        // made every put_triple fail), then create the fixed v2 index.
+        // Both are idempotent via try_run.
+        self.try_run(&MemorySchema::drop_legacy_triples_fts_index());
         self.try_run(&MemorySchema::create_triples_fts_index());
         self.try_run(&MemorySchema::create_summaries_vector_index(
             self.embedding_dim,
@@ -1055,6 +1059,22 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Remove a triple by its key.
+    pub fn remove_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<()> {
+        let script = format!(
+            "?[subject, predicate, object] <- [[$subject, $predicate, $object]]\n\
+             :rm {} {{subject, predicate, object}}",
+            MemorySchema::TRIPLES
+        );
+        let params = BTreeMap::from([
+            ("subject".into(), DataValue::Str(subject.into())),
+            ("predicate".into(), DataValue::Str(predicate.into())),
+            ("object".into(), DataValue::Str(object.into())),
+        ]);
+        self.run_mutable(&script, params)?;
+        Ok(())
+    }
+
     /// Run PageRank on the memory graph.
     pub fn page_rank(&self, iterations: usize) -> Result<HashMap<String, f64>> {
         let script = format!(
@@ -1380,7 +1400,7 @@ impl MemoryStore {
              last_mentioned, session_id, confidence] <- \
              [[$subject, $predicate, $object, $memory_id, $speaker, $mention_count, \
              $last_mentioned, $session_id, $confidence]]\n\
-             :put {} {{subject, predicate, object => memory_id, speaker, mention_count, \
+             :put {} {{subject, predicate, object, memory_id, speaker, mention_count, \
              last_mentioned, session_id, confidence}}",
             MemorySchema::TRIPLES
         );
@@ -1741,9 +1761,9 @@ impl MemoryStore {
         // Recursive Datalog: find all memories reachable within N hops
         let script = format!(
             "seed[id] <- [{seeds}] \n\
-             reachable[id, 0] := seed[id] \n\
-             reachable[to_id, d + 1] := reachable[from_id, d], \
-                 *{edges}{{from_id, to_id}}, d < {hops} \n\
+             reachable[id, d] := seed[id], d = 0 \n\
+             reachable[to_id, d2] := reachable[from_id, d], \
+                 *{edges}{{from_id, to_id}}, d2 = d + 1, d < {hops} \n\
              ?[id, content, type, hash, user_id, agent_id, session_id, \
                speaker, document_date, metadata_json, created_at, updated_at, \
                valid_at, invalid_at] := \

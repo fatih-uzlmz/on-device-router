@@ -24,7 +24,7 @@ impl MemorySchema {
     pub const VECTOR_INDEX: &'static str = "mem_vec_idx";
     pub const FTS_INDEX: &'static str = "mem_fts_idx";
     pub const LSH_INDEX: &'static str = "mem_lsh_idx";
-    pub const TRIPLES_FTS_INDEX: &'static str = "mem_triples_fts";
+    pub const TRIPLES_FTS_INDEX: &'static str = "mem_triples_fts_v2";
     pub const SUMMARIES_VECTOR_INDEX: &'static str = "mem_summaries_vec";
 
     /// Generate the DDL for all relations.
@@ -137,14 +137,27 @@ impl MemorySchema {
     }
 
     /// FTS index on semantic triples for free-text lookup of subject/predicate/object.
+    ///
+    /// NOTE: the extractor must be a *string* expression. The original index
+    /// shipped with `extractor: [subject, predicate, object]` (a list), which
+    /// CozoDB parses as a list expression -- every `put_triple` then failed
+    /// with "FTS index extractor must return a string". Fixed here with
+    /// `concat(...)`; the legacy broken index is dropped on open (see
+    /// `drop_legacy_triples_fts_index`).
     pub fn create_triples_fts_index() -> String {
         format!(
-            "::fts create {}:{}  {{ extractor: [subject, predicate, object], \
+            "::fts create {}:{}  {{ extractor: concat(subject, ' ', predicate, ' ', object), \
              tokenizer: Simple, \
              filters: [Lowercase, AlphaNumOnly, Stemmer('english')] }}",
             Self::TRIPLES,
             Self::TRIPLES_FTS_INDEX
         )
+    }
+
+    /// Drop the original (broken-extractor) triples FTS index, if present.
+    /// Idempotent: dropping a missing index errors, which `try_run` ignores.
+    pub fn drop_legacy_triples_fts_index() -> String {
+        format!("::fts drop {}:mem_triples_fts", Self::TRIPLES)
     }
 
     /// HNSW vector index on session summaries for semantic retrieval.

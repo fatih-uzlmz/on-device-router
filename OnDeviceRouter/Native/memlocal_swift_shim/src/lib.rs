@@ -249,6 +249,83 @@ pub extern "C" fn memlocal_search_router_hybrid(
     })
 }
 
+/// Graph traversal from seed memory IDs (mirrors the app's 2-hop expansion).
+#[no_mangle]
+pub extern "C" fn memlocal_search_router_graph(
+    handle: *mut c_void,
+    seed_ids_json: *const c_char,
+    max_hops: u32,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    status_code(|| {
+        if out_json.is_null() {
+            return Err("null out pointer".to_owned());
+        }
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+        let json = read_c_string(seed_ids_json)?;
+        let seed_ids: Vec<String> = serde_json::from_str(&json)
+            .map_err(|error| format!("invalid seed ids JSON: {error}"))?;
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        let items = engine
+            .search_graph_recursive(&seed_ids, max_hops as usize, None)
+            .map_err(|error| error.to_string())?;
+        let out = serde_json::to_string(&items).map_err(|error| error.to_string())?;
+        let result = CString::new(out).map_err(|error| error.to_string())?;
+        unsafe {
+            *out_json = result.into_raw();
+        }
+        Ok(())
+    })
+}
+
+/// Contradiction detection over the synced triple store.
+/// Returns JSON: [{subject, predicate, oldObject, newObject, oldMemoryId, newMemoryId}]
+#[no_mangle]
+pub extern "C" fn memlocal_find_contradicting_triples(
+    handle: *mut c_void,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    status_code(|| {
+        if out_json.is_null() {
+            return Err("null out pointer".to_owned());
+        }
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+        if handle.is_null() {
+            return Err("null engine handle".to_owned());
+        }
+        let engine = unsafe { &*handle.cast::<MemlocalEngine>() };
+        let pairs = engine
+            .find_contradicting_triples()
+            .map_err(|error| error.to_string())?;
+        let out: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|(old, new)| {
+                serde_json::json!({
+                    "subject": old.subject,
+                    "predicate": old.predicate,
+                    "oldObject": old.object,
+                    "newObject": new.object,
+                    "oldMemoryId": old.memory_id,
+                    "newMemoryId": new.memory_id,
+                })
+            })
+            .collect();
+        let json = serde_json::to_string(&out).map_err(|error| error.to_string())?;
+        let result = CString::new(json).map_err(|error| error.to_string())?;
+        unsafe {
+            *out_json = result.into_raw();
+        }
+        Ok(())
+    })
+}
+
 /// Reconcile the persistent shadow ledger with the latest Swift snapshot.
 #[no_mangle]
 pub extern "C" fn memlocal_sync_router_ledger(

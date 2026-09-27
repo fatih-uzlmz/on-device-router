@@ -405,8 +405,9 @@ impl MemlocalEngine {
                 "ledger import requires an empty shadow database".into(),
             ));
         }
-        for (_, item, embedding) in prepared {
-            self.store.put_memory(&item, &embedding)?;
+        for (record, item, embedding) in &prepared {
+            self.store.put_memory(item, embedding)?;
+            self.reconcile_router_record_graph(record)?;
         }
         Ok(envelope.records.len())
     }
@@ -436,16 +437,109 @@ impl MemlocalEngine {
                 continue;
             }
             self.store.put_memory(&item, &embedding)?;
+            self.reconcile_router_record_graph(&record)?;
             changed += 1;
         }
 
         for old in current.records {
             if !incoming_ids.contains(&old.id) {
                 self.store.delete_memory(&old.id)?;
+                self.remove_router_record_graph(&old)?;
                 changed += 1;
             }
         }
         Ok(changed)
+    }
+
+    /// Detect contradicting triples via the consolidation engine.
+    pub fn find_contradicting_triples(&self) -> Result<Vec<(Triple, Triple)>> {
+        self.consolidator.find_contradicting_triples()
+    }
+
+    /// Parse the opaque Swift payload of a ledger record.
+    fn router_record_payload(record: &RouterLedgerRecord) -> Result<serde_json::Value> {
+        serde_json::from_str(&record.payload_json).map_err(|error| {
+            crate::error::MemlocalError::InvalidArgument(format!(
+                "invalid payload JSON for ledger record {}: {error}",
+                record.id
+            ))
+        })
+    }
+
+    /// Extract the fact's own (subject, predicate, object) triple, if present.
+    fn router_fact_triple(payload: &serde_json::Value) -> Option<(String, String, String)> {
+        let triple = payload.get("triple")?;
+        Some((
+            triple.get("subject")?.as_str()?.to_owned(),
+            triple.get("predicate")?.as_str()?.to_owned(),
+            triple.get("object")?.as_str()?.to_owned(),
+        ))
+    }
+
+    /// Reconcile knowledge-graph edges and triple-store entries for a synced
+    /// ledger record. Only active durable facts contribute outgoing edges,
+    /// mirroring the app's traversal semantics.
+    fn reconcile_router_record_graph(&self, record: &RouterLedgerRecord) -> Result<()> {
+        // Drop stale outgoing edges; they are rebuilt from the payload below.
+        for edge in self.store.get_edges_from(&record.id)? {
+            self.store
+                .remove_edge(&edge.from_id, &edge.to_id, &edge.relation.to_string())?;
+        }
+        // Drop the previous triple for this record, if any.
+        if let Ok(payload) = Self::router_record_payload(record) {
+            if let Some((subject, predicate, object)) = Self::router_fact_triple(&payload) {
+                let _ = self.store.remove_triple(&subject, &predicate, &object);
+            }
+        }
+        if record.kind.as_str() != "durableFact" {
+            return Ok(());
+        }
+        let payload = Self::router_record_payload(record)?;
+        // Edges from the fact's related-fact adjacency list.
+        if let Some(related) = payload.get("relatedFactIDs").and_then(|value| value.as_array()) {
+            for target in related.iter().filter_map(|value| value.as_str()) {
+                if target == record.id {
+                    continue;
+                }
+                let edge =
+                    MemoryEdge::new(record.id.clone(), target.to_owned(), MemoryRelation::RelatesTo);
+                self.store.put_edge(&edge)?;
+            }
+        }
+        // Triple-store entry from the fact's own SVO triple, keyed to the fact
+        // so contradiction detection can map back to it.
+        if let Some((subject, predicate, object)) = Self::router_fact_triple(&payload) {
+            let triple = Triple {
+                subject,
+                predicate,
+                object,
+                memory_id: record.id.clone(),
+                speaker: "user".to_owned(),
+                mention_count: 1,
+                last_mentioned: record.updated_at,
+                session_id: String::new(),
+                confidence: payload
+                    .get("confidence")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(1.0),
+            };
+            self.store.put_triple(&triple)?;
+        }
+        Ok(())
+    }
+
+    /// Remove every graph edge and triple that references a deleted record.
+    fn remove_router_record_graph(&self, record: &RouterLedgerRecord) -> Result<()> {
+        for edge in self.get_edges(&record.id)? {
+            self.store
+                .remove_edge(&edge.from_id, &edge.to_id, &edge.relation.to_string())?;
+        }
+        if let Ok(payload) = Self::router_record_payload(record) {
+            if let Some((subject, predicate, object)) = Self::router_fact_triple(&payload) {
+                let _ = self.store.remove_triple(&subject, &predicate, &object);
+            }
+        }
+        Ok(())
     }
 
     /// Export and validate the opaque Swift records from the shadow database.
@@ -1091,6 +1185,134 @@ mod router_ledger_tests {
             engine.close().unwrap();
         }
 
+        remove_database(&path);
+    }
+
+    fn graph_record(
+        id: &str,
+        statement: &str,
+        triple: serde_json::Value,
+        related: Vec<&str>,
+        created_at: f64,
+        updated_at: f64,
+    ) -> RouterLedgerRecord {
+        record(
+            "durableFact",
+            statement,
+            created_at + APPLE_EPOCH_OFFSET,
+            updated_at + APPLE_EPOCH_OFFSET,
+            None,
+            serde_json::json!({
+                "id": id,
+                "statement": statement,
+                "triple": triple,
+                "relatedFactIDs": related,
+                "confidence": 0.9,
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+                "invalidatedAt": null,
+                "embedding": [0.5, 0.2, 0.3, 0.4],
+                "embeddingProviderVersion": "nl-en-rev-1",
+                "sources": []
+            }),
+        )
+    }
+
+    #[test]
+    fn sync_reconciles_graph_edges_and_triples() {
+        let path = database_path();
+        let config = config(&path);
+        let created_at = UNIX_TIME - APPLE_EPOCH_OFFSET;
+        let updated_at = created_at + 10.0;
+        let fact_a_id = uuid::Uuid::new_v4().to_string();
+        let fact_b_id = uuid::Uuid::new_v4().to_string();
+
+        let mut envelope = RouterLedgerEnvelope::empty();
+        envelope.records = vec![
+            graph_record(
+                &fact_a_id,
+                "User likes Rust.",
+                serde_json::json!({"subject": "User", "predicate": "likes", "object": "Rust"}),
+                vec![&fact_b_id],
+                created_at,
+                updated_at,
+            ),
+            graph_record(
+                &fact_b_id,
+                "Rust is a systems language.",
+                serde_json::json!({"subject": "Rust", "predicate": "is", "object": "systems language"}),
+                vec![],
+                created_at,
+                updated_at,
+            ),
+        ];
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        let engine = MemlocalEngine::open(config).unwrap();
+        assert_eq!(engine.sync_router_ledger(&json).unwrap(), 2);
+
+        // Edge from A to B exists.
+        let edges = engine.get_edges(&fact_a_id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from_id, fact_a_id);
+        assert_eq!(edges[0].to_id, fact_b_id);
+
+        // Graph traversal from A reaches B.
+        let reached = engine
+            .search_graph_recursive(&[fact_a_id.clone()], 2, None)
+            .unwrap();
+        let reached_ids: Vec<&str> = reached.iter().map(|item| item.id.as_str()).collect();
+        assert!(reached_ids.contains(&fact_a_id.as_str()));
+        assert!(reached_ids.contains(&fact_b_id.as_str()));
+
+        // No contradictions yet.
+        assert!(engine.find_contradicting_triples().unwrap().is_empty());
+
+        engine.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
+    fn contradicting_triples_are_detected_after_sync() {
+        let path = database_path();
+        let config = config(&path);
+        let created_at = UNIX_TIME - APPLE_EPOCH_OFFSET;
+        let fact_old_id = uuid::Uuid::new_v4().to_string();
+        let fact_new_id = uuid::Uuid::new_v4().to_string();
+
+        let mut envelope = RouterLedgerEnvelope::empty();
+        envelope.records = vec![
+            graph_record(
+                &fact_old_id,
+                "User likes Python.",
+                serde_json::json!({"subject": "User", "predicate": "likes", "object": "Python"}),
+                vec![],
+                created_at,
+                created_at + 10.0,
+            ),
+            graph_record(
+                &fact_new_id,
+                "User likes Rust.",
+                serde_json::json!({"subject": "User", "predicate": "likes", "object": "Rust"}),
+                vec![],
+                created_at,
+                created_at + 20.0,
+            ),
+        ];
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        let engine = MemlocalEngine::open(config).unwrap();
+        assert_eq!(engine.sync_router_ledger(&json).unwrap(), 2);
+
+        let contradictions = engine.find_contradicting_triples().unwrap();
+        assert_eq!(contradictions.len(), 1);
+        let (old, new) = &contradictions[0];
+        assert_eq!(old.memory_id, fact_old_id);
+        assert_eq!(old.object, "Python");
+        assert_eq!(new.memory_id, fact_new_id);
+        assert_eq!(new.object, "Rust");
+
+        engine.close().unwrap();
         remove_database(&path);
     }
 

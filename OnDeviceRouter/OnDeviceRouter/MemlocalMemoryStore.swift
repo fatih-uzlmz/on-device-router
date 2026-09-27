@@ -11,6 +11,9 @@ actor MemlocalMemoryStore: MemoryStore {
     private var didHydrateIndex = false
     private var hydrationTask: Task<MemorySnapshot, Never>?
     private var indexFailure: String?
+    /// Set when a Rust ledger sync fails; retried on next ingest and launch.
+    /// Swift JSON persistence stays enabled as the crash-safe cache meanwhile.
+    private var ledgerDirty = false
 
     init(primary: SimpleMemoryStore = SimpleMemoryStore(), databaseURL: URL? = nil) {
         self.primary = primary
@@ -31,8 +34,25 @@ actor MemlocalMemoryStore: MemoryStore {
                              route: route, extractedFacts: extractedFacts)
         let snapshot = await primary.snapshot()
         if !synchronizeLedger(with: snapshot) {
+            // Rust is the commit point; keep Swift JSON as crash-safe cache
+            // and retry the sync on the next ingest instead of diverging silently.
+            ledgerDirty = true
             await primary.configurePersistence(enabled: true, persistCurrent: true)
+        } else if ledgerDirty {
+            ledgerDirty = false
+            print("[Memory][Memlocal] dirty ledger recovered on ingest")
         }
+    }
+
+    /// Retry a failed Rust sync (see ledgerDirty). Returns true when clean.
+    private func retryDirtyLedger() async -> Bool {
+        guard ledgerDirty, isIndexAvailable else { return !ledgerDirty }
+        if synchronizeLedger(with: await primary.snapshot()) {
+            ledgerDirty = false
+            print("[Memory][Memlocal] dirty ledger recovered on retry")
+            return true
+        }
+        return false
     }
 
     func snapshot() async -> MemorySnapshot {
@@ -98,10 +118,17 @@ actor MemlocalMemoryStore: MemoryStore {
             if let fact = factsByID[id] { append(fact) }
         }
 
-        // Use the Rust hits as seeds for the existing, validated two-hop graph.
-        let graphSeeds = graphSeedIDs.compactMap(UUID.init(uuidString:))
-        let graphFacts = await primary.graphExpansion(from: graphSeeds, maxHops: 2)
-        for fact in graphFacts { append(fact) }
+        // Expand through the Rust knowledge graph (2 hops from hybrid seeds).
+        // Falls back to Swift's traversal when Rust yields nothing.
+        let rustGraphIDs = index.searchGraph(seedIDs: graphSeedIDs, maxHops: 2)
+        print("[Memory][GraphRecall] rust=\(rustGraphIDs.count) seeds=\(graphSeedIDs.count)")
+        let rustGraphFacts = rustGraphIDs.compactMap { factsByID[$0] }
+        if rustGraphFacts.isEmpty {
+            let graphSeeds = graphSeedIDs.compactMap(UUID.init(uuidString:))
+            for fact in await primary.graphExpansion(from: graphSeeds, maxHops: 2) { append(fact) }
+        } else {
+            for fact in rustGraphFacts { append(fact) }
+        }
 
         for id in eligibleHybridIDs.dropFirst(graphSeedIDs.count) {
             if let fact = factsByID[id] { append(fact) }
@@ -133,7 +160,7 @@ actor MemlocalMemoryStore: MemoryStore {
             relationshipsByID[relationship.id] = relationship
         }
 
-        print("[Memory][Memlocal] recalled \(facts.count) fact(s); Rust additions=\(externallySelected.count), graph seeds=\(graphSeeds.count)")
+        print("[Memory][Memlocal] recalled \(facts.count) fact(s); Rust additions=\(externallySelected.count), graph seeds=\(graphSeedIDs.count)")
         return MemoryRecall(
             facts: facts,
             episodes: swiftRecall.episodes,
@@ -232,10 +259,36 @@ actor MemlocalMemoryStore: MemoryStore {
             if isIndexAvailable {
                 print("[Memory][Memlocal] Rust ledger authoritative; records=\(rustEnvelope.records.count)")
             }
+            // Consolidation runs dry-run/log-only until apply mode is enabled
+            // after on-device log review (a bug here could wipe real memories).
+            await runConsolidationMaintenance(apply: false)
+            await retryDirtyLedger()
         } catch {
             disableIndex(error.localizedDescription)
         }
         didHydrateIndex = true
+    }
+
+    /// Scan for contradicting triples and log them. Dry-run by default:
+    /// apply mode (which would invalidate the older fact) stays off until
+    /// the on-device logs are reviewed.
+    func runConsolidationMaintenance(apply: Bool = false) async {
+        await ensureIndexIsHydrated()
+        guard isIndexAvailable, let index else { return }
+        let pairs = index.findContradictingTriples()
+        guard !pairs.isEmpty else {
+            print("[Memory][Consolidation] scan complete; no contradictions")
+            return
+        }
+        print("[Memory][Consolidation] found \(pairs.count) contradicting triple(s) (apply=\(apply))")
+        for pair in pairs {
+            print("[Memory][Consolidation] \(pair.subject) | \(pair.predicate) | old='\(pair.oldObject)' (\(pair.oldMemoryId)) -> new='\(pair.newObject)' (\(pair.newMemoryId))")
+        }
+        if apply {
+            // Apply mode: invalidate the older fact in Swift, then re-sync.
+            // Deliberately unwired until dry-run logs are reviewed on device.
+            print("[Memory][Consolidation] apply mode requested but not yet enabled; no changes made")
+        }
     }
 
     private func synchronizeLedger(with snapshot: MemorySnapshot) -> Bool {
@@ -446,6 +499,17 @@ nonisolated private struct RouterHybridEmbedding: Encodable {
     let providerVersion: String
 }
 
+/// A pair of triples where a newer memory contradicts an older one.
+/// Returned by the Rust consolidation scan; Swift decides what to do.
+struct ContradictingTriple: Decodable {
+    let subject: String
+    let predicate: String
+    let oldObject: String
+    let newObject: String
+    let oldMemoryId: String
+    let newMemoryId: String
+}
+
 /// Synchronous, actor-confined owner of the C ABI handle.
 nonisolated private final class MemlocalSearchIndex {
     private let config: String
@@ -549,6 +613,44 @@ nonisolated private final class MemlocalSearchIndex {
             return []
         }
         return results.map(\.id)
+    }
+
+    func searchGraph(seedIDs: [String], maxHops: Int) -> [String] {
+        guard let handle else { return [] }
+        guard let data = try? JSONEncoder().encode(seedIDs),
+              let seedJSON = String(data: data, encoding: .utf8) else {
+            lastError = "Could not encode graph seed IDs"
+            return []
+        }
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        let status = seedJSON.withCString { seedPointer in
+            memlocal_search_router_graph(handle, seedPointer, UInt32(clamping: maxHops), &jsonPointer)
+        }
+        guard record(status), let jsonPointer else { return [] }
+        defer { memlocal_free_string(jsonPointer) }
+
+        struct SearchResult: Decodable { let id: String }
+        guard let data = String(cString: jsonPointer).data(using: .utf8),
+              let results = try? JSONDecoder().decode([SearchResult].self, from: data) else {
+            lastError = "MemLocal returned invalid graph search JSON"
+            return []
+        }
+        return results.map(\.id)
+    }
+
+    func findContradictingTriples() -> [ContradictingTriple] {
+        guard let handle else { return [] }
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        let status = memlocal_find_contradicting_triples(handle, &jsonPointer)
+        guard record(status), let jsonPointer else { return [] }
+        defer { memlocal_free_string(jsonPointer) }
+
+        guard let data = String(cString: jsonPointer).data(using: .utf8),
+              let pairs = try? JSONDecoder().decode([ContradictingTriple].self, from: data) else {
+            lastError = "MemLocal returned invalid contradiction JSON"
+            return []
+        }
+        return pairs
     }
 
     func close() {
