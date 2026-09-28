@@ -68,6 +68,7 @@ final class RoutingEngine: ObservableObject {
     func answer(_ query: String) async throws -> RoutedAnswer {
         let turnID = String(UUID().uuidString.prefix(8))
         print("[Debug][Turn \(turnID)] started in local-only mode")
+        print("[Memory][Footprint] turn start: \(footprintMB()) MB")
         let priorUserMessages = recentUserMessages
         recentUserMessages.append(query)
         if recentUserMessages.count > 8 {
@@ -104,6 +105,7 @@ final class RoutingEngine: ObservableObject {
 
         let latencyMs = Int(Date().timeIntervalSince(start) * 1000)
         print("[Debug][Turn \(turnID)] Llama generation complete: \(latencyMs)ms, \(text.count) characters")
+        print("[Memory][Footprint] post-generate: \(footprintMB()) MB")
         // Safety net: never hand the user a bare fragment for a statement.
         if text.split(separator: " ").count <= 3
             && !query.trimmingCharacters(in: .whitespaces).hasSuffix("?") {
@@ -115,12 +117,14 @@ final class RoutingEngine: ObservableObject {
         let activeFacts = await memory.snapshot().durableFacts
         let extractedFacts = await local.extractMemories(from: query,
                                                          existingFacts: activeFacts)
+        print("[Memory][Footprint] post-extract: \(footprintMB()) MB")
         await memory.ingest(userMessage: query,
                             assistantMessage: text,
                             route: RouteDestination.local.rawValue,
                             extractedFacts: extractedFacts)
         await refreshMemoryDiagnostics()
         print("[Debug][Turn \(turnID)] persisted: stored=\(memoryDiagnostics.storedCount), fileExists=\(memoryDiagnostics.fileExists), bytes=\(memoryDiagnostics.fileSizeBytes)")
+        print("[Memory][Footprint] post-ingest: \(footprintMB()) MB")
         print("[Debug][Turn \(turnID)] finished")
 
         return RoutedAnswer(text: text, destination: decision.destination,
@@ -135,6 +139,20 @@ final class RoutingEngine: ObservableObject {
 
     private func updateLocalModelStatus(_ status: LocalModelStatus) {
         localModelStatus = status
+    }
+
+    /// Current app memory footprint in MB (phys_footprint), for Jetsam diagnosis.
+    private func footprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint) / 1_048_576
     }
 
     func refreshMemoryDiagnostics() async {

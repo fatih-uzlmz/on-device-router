@@ -1,5 +1,6 @@
 import Foundation
 import HuggingFace
+import MLX
 import MLXLLM
 import MLXLMCommon
 import Tokenizers
@@ -197,6 +198,10 @@ actor LocalModelService: LocalModelResponding {
 
     func extractMemories(from message: String, existingFacts: [DurableFact]) async -> [MemoryCandidate] {
         do {
+            // Release MLX cached Metal buffers when the turn's last LLM call
+            // finishes. The allocator otherwise holds freed buffers and the
+            // app footprint grows turn over turn toward the Jetsam limit.
+            defer { MLX.Memory.clearCache() }
             let container = try await loadModel(status: { _ in })
             let raw = try await generate(
                 prompt: MemoryExtraction.prompt(for: message),
@@ -208,9 +213,14 @@ actor LocalModelService: LocalModelResponding {
                                                existingFacts: existingFacts)
             let sentences = MemoryExtraction.sentences(in: message)
             if sentences.count > 1 && !facts.contains(where: { $0.replacesFactID != nil }) {
+                // Cap per-sentence generations: each one is a full LLM call, and the
+                // burst is what pushes the app toward the Jetsam limit.
+                var extraGenerations = 0
                 for sentence in sentences where !facts.contains(where: {
                     sentence.range(of: $0.evidence, options: .caseInsensitive) != nil
                 }) {
+                    guard extraGenerations < 2 else { break }
+                    extraGenerations += 1
                     let sentenceRaw = try await generate(
                         prompt: MemoryExtraction.prompt(for: sentence),
                         history: [],
