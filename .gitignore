@@ -12,3 +12,6 @@ xcuserdata/
 
 # Local code-analysis artifacts
 graphify-out/
+
+# Rust build artifacts (memlocal_core / memlocal_swift_shim)
+target/

@@ -1116,6 +1116,98 @@ mod router_ledger_tests {
     }
 
     #[test]
+    fn hybrid_search_retrieves_paraphrased_facts_above_keyword_distractors() {
+        let vectors: std::collections::BTreeMap<String, Vec<f64>> = serde_json::from_str(
+            include_str!("../../tests/fixtures/semantic_vectors.json"),
+        )
+        .unwrap();
+        let facts = [
+            "My sister Sarah loves chocolate cake",
+            "My sibling enjoys hiking on weekends",
+            "I live in Toronto",
+            "I visited Tokyo last spring",
+            "My favorite programming language is Rust",
+            "Python is popular for data science",
+            "My car gets serviced every six months",
+            "The meeting is scheduled for Tuesday morning",
+        ];
+        let queries = [
+            (
+                "What dessert does my sibling enjoy?",
+                "My sister Sarah loves chocolate cake",
+                "My sibling enjoys hiking on weekends",
+            ),
+            (
+                "Which city do I reside in?",
+                "I live in Toronto",
+                "I visited Tokyo last spring",
+            ),
+            (
+                "What coding language do I prefer?",
+                "My favorite programming language is Rust",
+                "Python is popular for data science",
+            ),
+        ];
+        assert_eq!(vectors.len(), facts.len() + queries.len());
+        assert!(vectors.values().all(|vector| vector.len() == 512));
+
+        let created_at = UNIX_TIME - APPLE_EPOCH_OFFSET;
+        let mut envelope = RouterLedgerEnvelope::empty();
+        for (index, fact) in facts.iter().enumerate() {
+            let id = format!("00000000-0000-4000-8000-{:012x}", index + 1);
+            envelope.records.push(record(
+                "durableFact",
+                fact,
+                UNIX_TIME,
+                UNIX_TIME,
+                None,
+                serde_json::json!({
+                    "id": id,
+                    "statement": fact,
+                    "createdAt": created_at,
+                    "updatedAt": created_at,
+                    "invalidatedAt": null,
+                    "embedding": vectors[*fact],
+                    "embeddingProviderVersion": "nl-en-rev-1",
+                    "sources": []
+                }),
+            ));
+        }
+
+        let path = database_path();
+        let engine = MemlocalEngine::open(config(&path)).unwrap();
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(engine.sync_router_ledger(&json).unwrap(), facts.len());
+
+        for (query, expected, distractor) in queries {
+            let lexical: Vec<_> = engine
+                .search_router_facts_text(query, facts.len())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.content)
+                .collect();
+            assert!(
+                !lexical.iter().any(|fact| fact == expected),
+                "text-only search unexpectedly retrieved {expected} for {query}"
+            );
+            let results = engine
+                .search_router_facts_hybrid(query, &vectors[query], "nl-en-rev-1", facts.len())
+                .unwrap();
+            let ranked: Vec<_> = results.iter().map(|item| item.content.as_str()).collect();
+            assert_eq!(ranked.len(), facts.len(), "query: {query}");
+            assert_eq!(ranked[0], expected, "query: {query}; ranking: {ranked:?}");
+            assert!(
+                ranked.iter().position(|fact| *fact == expected)
+                    < ranked.iter().position(|fact| *fact == distractor),
+                "query: {query}; ranking: {ranked:?}"
+            );
+        }
+
+        engine.close().unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
     fn sync_round_trips_full_ledger_after_reopen_and_filters_invalidated_facts() {
         let path = database_path();
         let config = config(&path);

@@ -9,6 +9,7 @@ actor MemlocalMemoryStore: MemoryStore {
     private let databaseURL: URL
     private var index: MemlocalSearchIndex?
     private var didHydrateIndex = false
+    private var hydrationFailures = 0
     private var hydrationTask: Task<MemorySnapshot, Never>?
     private var indexFailure: String?
     /// Set when a Rust ledger sync fails; retried on next ingest and launch.
@@ -259,19 +260,25 @@ actor MemlocalMemoryStore: MemoryStore {
             if isIndexAvailable {
                 print("[Memory][Memlocal] Rust ledger authoritative; records=\(rustEnvelope.records.count)")
             }
-            // Consolidation runs dry-run/log-only until apply mode is enabled
-            // after on-device log review (a bug here could wipe real memories).
+            // Hydration is complete before maintenance calls back into this method.
+            didHydrateIndex = true
             await runConsolidationMaintenance(apply: false)
             await retryDirtyLedger()
         } catch {
             disableIndex(error.localizedDescription)
+            hydrationFailures += 1
+            // Allow retry on next call unless we have failed repeatedly;
+            // the sim can transiently fail the first open (SQLITE_CANTOPEN).
+            if hydrationFailures < 3 {
+                self.hydrationTask = nil
+                return
+            }
         }
         didHydrateIndex = true
+        hydrationFailures = 0
     }
 
-    /// Scan for contradicting triples and log them. Dry-run by default:
-    /// apply mode (which would invalidate the older fact) stays off until
-    /// the on-device logs are reviewed.
+    /// Scan for contradicting triples. Apply is opt-in; hydration stays dry-run.
     func runConsolidationMaintenance(apply: Bool = false) async {
         await ensureIndexIsHydrated()
         guard isIndexAvailable, let index else { return }
@@ -283,11 +290,27 @@ actor MemlocalMemoryStore: MemoryStore {
         print("[Memory][Consolidation] found \(pairs.count) contradicting triple(s) (apply=\(apply))")
         for pair in pairs {
             print("[Memory][Consolidation] \(pair.subject) | \(pair.predicate) | old='\(pair.oldObject)' (\(pair.oldMemoryId)) -> new='\(pair.newObject)' (\(pair.newMemoryId))")
+            guard apply else { continue }
+            guard SimpleMemoryStore.isSingleValuedPredicate(pair.predicate) else {
+                print("[Memory][Consolidation] skipped multi-valued predicate '\(pair.predicate)'")
+                continue
+            }
+            guard let oldID = UUID(uuidString: pair.oldMemoryId) else {
+                print("[Memory][Consolidation] skipped invalid old memory ID '\(pair.oldMemoryId)'")
+                continue
+            }
+            if await primary.invalidateFact(id: oldID, timestamp: Date()) {
+                print("[Memory][Consolidation] invalidated old fact \(pair.oldMemoryId)")
+            }
         }
         if apply {
-            // Apply mode: invalidate the older fact in Swift, then re-sync.
-            // Deliberately unwired until dry-run logs are reviewed on device.
-            print("[Memory][Consolidation] apply mode requested but not yet enabled; no changes made")
+            let snapshot = await primary.snapshot()
+            if !synchronizeLedger(with: snapshot) {
+                ledgerDirty = true
+                await primary.configurePersistence(enabled: true, persistCurrent: true)
+            } else {
+                ledgerDirty = false
+            }
         }
     }
 
@@ -513,6 +536,7 @@ struct ContradictingTriple: Decodable {
 /// Synchronous, actor-confined owner of the C ABI handle.
 nonisolated private final class MemlocalSearchIndex {
     private let config: String
+    private let databaseURL: URL
     private var handle: UnsafeMutableRawPointer?
     private(set) var initializationError: String?
     private(set) var lastError: String?
@@ -520,6 +544,7 @@ nonisolated private final class MemlocalSearchIndex {
     var isAvailable: Bool { handle != nil }
 
     init(databaseURL: URL) {
+        self.databaseURL = databaseURL
         do {
             try FileManager.default.createDirectory(
                 at: databaseURL.deletingLastPathComponent(),
@@ -551,7 +576,18 @@ nonisolated private final class MemlocalSearchIndex {
             initializationError = error.localizedDescription
             return
         }
-        handle = config.withCString { memlocal_open($0) }
+        var attempt = 0
+        while handle == nil && attempt < 3 {
+            if attempt > 0 {
+                print("[Memory][Memlocal] retrying ledger open")
+                // A failed open may leave a partial/corrupt DB file behind;
+                // remove it so the retry starts clean (avoids SQLITE_NOTADB).
+                try? FileManager.default.removeItem(atPath: databaseURL.path)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            handle = config.withCString { memlocal_open($0) }
+            attempt += 1
+        }
         if handle == nil {
             initializationError = currentError()
         }

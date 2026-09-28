@@ -84,8 +84,13 @@ pub extern "C" fn memlocal_open(config_json: *const c_char) -> *mut c_void {
             set_error(error);
             ptr::null_mut()
         }
-        Err(_) => {
-            set_error("panic in memlocal_open".to_owned());
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|v| v.to_string()))
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            set_error(format!("panic in memlocal_open: {detail}"));
             ptr::null_mut()
         }
     }

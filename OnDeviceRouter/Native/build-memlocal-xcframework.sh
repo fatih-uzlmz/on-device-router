@@ -34,3 +34,9 @@ xcodebuild -create-xcframework \
 mkdir -p "$REPOSITORY_ROOT/OnDeviceRouter/Frameworks"
 rm -rf "$REPOSITORY_ROOT/OnDeviceRouter/Frameworks/MemlocalCore.xcframework"
 cp -R "$XCFRAMEWORK_OUTPUT" "$REPOSITORY_ROOT/OnDeviceRouter/Frameworks/MemlocalCore.xcframework"
+
+# Drift guard: record a canonical hash of the Rust sources that produced this
+# binary. The Swift test `rustSourceMatchesPrebuiltXcframework` fails if the
+# sources change without a rebuild.
+python3 "$NATIVE_DIR/rust_source_sha.py" > "$REPOSITORY_ROOT/OnDeviceRouter/Frameworks/rust-source-sha.txt"
+echo "Wrote Rust source hash to OnDeviceRouter/Frameworks/rust-source-sha.txt"

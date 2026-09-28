@@ -409,6 +409,28 @@ actor SimpleMemoryStore: MemoryStore {
 
     // MARK: - Fact lifecycle
 
+    nonisolated static func isSingleValuedPredicate(_ predicate: String) -> Bool {
+        singleValuedPredicates.contains(normalized(predicate))
+    }
+
+    @discardableResult
+    func invalidateFact(id: UUID, timestamp: Date) -> Bool {
+        guard let index = document.durableFacts.firstIndex(where: { $0.id == id }),
+              document.durableFacts[index].isActive else {
+            print("[Memory][Contradiction] skipped unknown or inactive fact \(id)")
+            return false
+        }
+        document.durableFacts[index].invalidatedAt = timestamp
+        document.durableFacts[index].confidence *= 0.5
+        for relationshipIndex in document.relationships.indices
+            where document.relationships[relationshipIndex].sourceFactID == id {
+            document.relationships[relationshipIndex].invalidatedAt = timestamp
+        }
+        rebuildFactGraph()
+        persist()
+        return true
+    }
+
     private func upsert(_ extracted: ExtractedFact, sourceText: String, timestamp: Date,
                         replacesFactID: UUID? = nil) {
         let key = Self.factKey(extracted.triple)
@@ -428,7 +450,7 @@ actor SimpleMemoryStore: MemoryStore {
             return
         }
 
-        if Self.singleValuedPredicates.contains(Self.normalized(extracted.triple.predicate))
+        if Self.isSingleValuedPredicate(extracted.triple.predicate)
             || replacesFactID != nil {
             for index in document.durableFacts.indices where document.durableFacts[index].isActive
                 && (Self.factKey(document.durableFacts[index].triple) == key
